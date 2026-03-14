@@ -4,8 +4,7 @@ Feature encoder: maps discrete feature tuples to hypervectors via codebooks.
 
 from __future__ import annotations
 
-import torch
-import torchhd
+import numpy as np
 
 from hyper_fingerprints.utils import TupleIndexer
 
@@ -20,32 +19,29 @@ class FeatureEncoder:
         indexer: TupleIndexer,
         *,
         seed: int | None = None,
-        dtype: str = "float64",
-        device: torch.device | str = "cpu",
+        codebook: np.ndarray | None = None,
     ) -> None:
         self.dim = dim
         self.num_categories = num_categories
         self.indexer = indexer
-        self.dtype = dtype
-        self.device = torch.device(device)
 
-        if seed is not None:
-            torch.manual_seed(seed)
-        self.codebook = self._generate_codebook()
+        if codebook is not None:
+            self.codebook = codebook
+        else:
+            rng = np.random.default_rng(seed)
+            self.codebook = self._generate_codebook(rng)
 
-    def _generate_codebook(self) -> torch.Tensor:
-        dt = torch.float64 if self.dtype == "float64" else torch.float32
-        cb = torchhd.random(
-            self.num_categories, self.dim, vsa="HRR", device="cpu", dtype=dt
-        )
-        return cb.to(self.device)
+    def _generate_codebook(self, rng: np.random.Generator) -> np.ndarray:
+        cb = rng.standard_normal((self.num_categories, self.dim))
+        norms = np.linalg.norm(cb, axis=-1, keepdims=True)
+        cb = cb / norms
+        return cb
 
-    def encode(self, data: torch.Tensor) -> torch.Tensor:
+    def encode(self, data: np.ndarray) -> np.ndarray:
         """Encode feature tuples ``[N, F]`` into hypervectors ``[N, D]``."""
-        data = data.long()
-        if data.dim() == 1:
-            data = data.unsqueeze(-1)
+        data = data.astype(np.int64)
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
         tup = list(map(tuple, data.tolist()))
         idxs = self.indexer.get_idxs(tup)
-        idxs_tens = torch.tensor(idxs, dtype=torch.long, device=self.device)
-        return self.codebook[idxs_tens]
+        return self.codebook[idxs]

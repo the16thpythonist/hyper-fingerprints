@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-import torch
 from rdkit import Chem
 
 from hyper_fingerprints.features import (
@@ -57,7 +56,7 @@ class TestMolToData:
         data = mol_to_data(mol, a2i)
         assert data.x.shape == (6, 5)
         # All atoms should be aromatic
-        assert data.x[:, 4].sum().item() == 6
+        assert data.x[:, 4].sum() == 6
 
     def test_unsupported_atom_raises(self):
         mol = Chem.MolFromSmiles("[Fe]")

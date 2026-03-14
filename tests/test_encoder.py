@@ -2,32 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
-import torch
 from rdkit import Chem
-from torch_geometric.data import Data
 
 from hyper_fingerprints import Encoder
-
-
-# ─────────────────────── Helpers ───────────────────────
-
-
-def _make_ethanol_data() -> Data:
-    """CCO as a raw PyG Data object (ZINC-style 5 features)."""
-    # C: atom=1, degree=1(idx=1), charge=0, Hs=3, aromatic=0
-    # C: atom=1, degree=2(idx=2), charge=0, Hs=2, aromatic=0
-    # O: atom=6, degree=1(idx=1), charge=0, Hs=1, aromatic=0
-    x = torch.tensor([
-        [1, 1, 0, 3, 0],
-        [1, 2, 0, 2, 0],
-        [6, 1, 0, 1, 0],
-    ], dtype=torch.float32)
-    edge_index = torch.tensor([
-        [0, 1, 1, 2],
-        [1, 0, 2, 1],
-    ], dtype=torch.long)
-    return Data(x=x, edge_index=edge_index)
 
 
 # ─────────────────────── Creation ───────────────────────
@@ -118,32 +99,7 @@ class TestEncodeMol:
         mol = Chem.MolFromSmiles("CCO")
         emb_mol = enc.encode(mol)
         emb_smi = enc.encode("CCO")
-        torch.testing.assert_close(emb_mol, emb_smi)
-
-
-# ─────────────────────── Encoding from Data ───────────────────────
-
-
-class TestEncodeData:
-
-    def test_single_data(self):
-        enc = Encoder()
-        data = _make_ethanol_data()
-        emb = enc.encode(data)
-        assert emb.shape == (1, 256)
-
-    def test_batch_data(self):
-        enc = Encoder()
-        data_list = [_make_ethanol_data(), _make_ethanol_data()]
-        embs = enc.encode(data_list)
-        assert embs.shape == (2, 256)
-
-    def test_data_matches_smiles(self):
-        """Data created from SMILES should match direct SMILES encoding."""
-        enc = Encoder(seed=42)
-        emb_smi = enc.encode("CCO")
-        emb_data = enc.encode(_make_ethanol_data())
-        torch.testing.assert_close(emb_smi, emb_data)
+        np.testing.assert_allclose(emb_mol, emb_smi, atol=1e-12, rtol=0)
 
 
 # ─────────────────────── encode_joint ───────────────────────
@@ -169,7 +125,7 @@ class TestEncodeJoint:
         orderN = joint[:, enc.dimension:]
         # orderN should equal encode()
         emb = enc.encode("CCO")
-        torch.testing.assert_close(orderN, emb)
+        np.testing.assert_allclose(orderN, emb, atol=1e-12, rtol=0)
 
 
 # ─────────────────────── Determinism ───────────────────────
@@ -182,20 +138,20 @@ class TestDeterminism:
         enc2 = Encoder(seed=42)
         emb1 = enc1.encode("CCO")
         emb2 = enc2.encode("CCO")
-        torch.testing.assert_close(emb1, emb2)
+        np.testing.assert_allclose(emb1, emb2, atol=1e-12, rtol=0)
 
     def test_different_seed_different_output(self):
         enc1 = Encoder(seed=1)
         enc2 = Encoder(seed=2)
         emb1 = enc1.encode("CCO")
         emb2 = enc2.encode("CCO")
-        assert not torch.allclose(emb1, emb2)
+        assert not np.allclose(emb1, emb2)
 
     def test_different_molecules_different_output(self):
         enc = Encoder(seed=42)
         emb1 = enc.encode("CCO")
         emb2 = enc.encode("c1ccccc1")
-        assert not torch.allclose(emb1, emb2)
+        assert not np.allclose(emb1, emb2)
 
 
 # ─────────────────────── Type errors ───────────────────────
@@ -205,10 +161,67 @@ class TestTypeErrors:
 
     def test_bad_type_raises(self):
         enc = Encoder()
-        with pytest.raises(TypeError, match="Expected str, Chem.Mol, or Data"):
+        with pytest.raises(TypeError, match="Expected str or Chem.Mol"):
             enc.encode(42)
 
     def test_bad_type_in_list_raises(self):
         enc = Encoder()
         with pytest.raises(TypeError):
             enc.encode(["CCO", 42])
+
+
+# ─────────────────────── Save / Load ───────────────────────
+
+
+class TestSaveLoad:
+
+    def test_round_trip(self, tmp_path: Path):
+        enc = Encoder(seed=42)
+        emb_before = enc.encode(["CCO", "c1ccccc1"])
+
+        path = tmp_path / "encoder.npz"
+        enc.save(path)
+        loaded = Encoder.load(path)
+
+        assert loaded.dimension == enc.dimension
+        assert loaded.depth == enc.depth
+        assert loaded.atom_types == enc.atom_types
+        assert loaded.normalize == enc.normalize
+        assert loaded.seed == enc.seed
+        np.testing.assert_array_equal(loaded._codebook, enc._codebook)
+        np.testing.assert_allclose(
+            loaded.encode(["CCO", "c1ccccc1"]), emb_before, atol=1e-12, rtol=0,
+        )
+
+    def test_round_trip_custom_params(self, tmp_path: Path):
+        enc = Encoder(
+            dimension=128, depth=5, atom_types=["C", "N", "O"],
+            normalize=True, seed=99,
+        )
+        emb_before = enc.encode("CCO")
+
+        path = tmp_path / "encoder.npz"
+        enc.save(path)
+        loaded = Encoder.load(path)
+
+        assert loaded.dimension == 128
+        assert loaded.depth == 5
+        assert loaded.atom_types == ["C", "N", "O"]
+        assert loaded.normalize is True
+        assert loaded.seed == 99
+        np.testing.assert_allclose(
+            loaded.encode("CCO"), emb_before, atol=1e-12, rtol=0,
+        )
+
+    def test_round_trip_no_seed(self, tmp_path: Path):
+        enc = Encoder()
+        emb_before = enc.encode("CCO")
+
+        path = tmp_path / "encoder.npz"
+        enc.save(path)
+        loaded = Encoder.load(path)
+
+        assert loaded.seed is None
+        np.testing.assert_allclose(
+            loaded.encode("CCO"), emb_before, atol=1e-12, rtol=0,
+        )

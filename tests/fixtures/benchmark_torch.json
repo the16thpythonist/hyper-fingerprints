@@ -1,0 +1,266 @@
+{
+  "encode_individual_C": {
+    "mean": 0.00015548247960396112,
+    "std": 8.16149038712624e-06
+  },
+  "encode_individual_CC": {
+    "mean": 0.00021049378003226593,
+    "std": 3.747965290055318e-06
+  },
+  "encode_individual_C=C": {
+    "mean": 0.0003600360808195546,
+    "std": 0.00010401942236337416
+  },
+  "encode_individual_c1ccccc1": {
+    "mean": 0.000506470461259596,
+    "std": 0.0001046296627604875
+  },
+  "encode_individual_CCO": {
+    "mean": 0.000273061751795467,
+    "std": 1.2333807080853775e-05
+  },
+  "encode_individual_CC(=O)O": {
+    "mean": 0.0003165575210005045,
+    "std": 6.976042848358048e-06
+  },
+  "encode_individual_CC(=O)Oc1ccccc1C(=O)O": {
+    "mean": 0.0008914236203418114,
+    "std": 0.00010610692424183623
+  },
+  "encode_individual_O": {
+    "mean": 0.0001530906610423699,
+    "std": 4.116795198976644e-06
+  },
+  "encode_individual_CN": {
+    "mean": 0.000217489650240168,
+    "std": 7.574082315158606e-06
+  },
+  "encode_individual_c1ccncc1": {
+    "mean": 0.00048623434966430065,
+    "std": 4.615973569614527e-05
+  },
+  "encode_individual_c1ccc(N)cc1": {
+    "mean": 0.000537461499334313,
+    "std": 2.4772290032979305e-05
+  },
+  "encode_individual_c1ccc2[nH]ccc2c1": {
+    "mean": 0.0006799364413018339,
+    "std": 2.2601313245176287e-05
+  },
+  "encode_individual_CC(=O)Nc1ccc(O)cc1": {
+    "mean": 0.0007608573097968474,
+    "std": 1.1206810754335855e-05
+  },
+  "encode_individual_CF": {
+    "mean": 0.00022651933919405566,
+    "std": 8.735543098868797e-06
+  },
+  "encode_individual_c1ccc(F)cc1": {
+    "mean": 0.0005417475386639126,
+    "std": 1.2835424279377207e-05
+  },
+  "encode_individual_FC(F)(F)c1ccccc1": {
+    "mean": 0.000703276488929987,
+    "std": 3.2258022562803454e-05
+  },
+  "encode_individual_CCl": {
+    "mean": 0.0002245096303522587,
+    "std": 7.646628657281608e-06
+  },
+  "encode_individual_c1ccc(Cl)cc1": {
+    "mean": 0.0005474826102727093,
+    "std": 1.2842761502757998e-05
+  },
+  "encode_individual_ClC(Cl)Cl": {
+    "mean": 0.00032619510864606127,
+    "std": 3.951971685615208e-06
+  },
+  "encode_individual_CBr": {
+    "mean": 0.00021540222107432783,
+    "std": 6.715485099048347e-06
+  },
+  "encode_individual_c1ccc(Br)cc1": {
+    "mean": 0.0005463894907734357,
+    "std": 2.5570824386840704e-05
+  },
+  "encode_individual_CI": {
+    "mean": 0.00022601973760174587,
+    "std": 1.4748673577628451e-05
+  },
+  "encode_individual_c1ccc(I)cc1": {
+    "mean": 0.0005917063896777108,
+    "std": 6.768149376733465e-05
+  },
+  "encode_individual_CSC": {
+    "mean": 0.0002777807993697934,
+    "std": 5.921747113970137e-06
+  },
+  "encode_individual_c1ccsc1": {
+    "mean": 0.000435333289206028,
+    "std": 2.306277350139297e-05
+  },
+  "encode_individual_CS(C)=O": {
+    "mean": 0.0003631014161510393,
+    "std": 5.795605156467619e-05
+  },
+  "encode_individual_CP(C)C": {
+    "mean": 0.00038102671067463234,
+    "std": 2.8952567716590976e-05
+  },
+  "encode_individual_OP(O)(O)=O": {
+    "mean": 0.0006207579001784324,
+    "std": 0.00033556543622900666
+  },
+  "encode_individual_c1cc(F)c(Cl)cc1Br": {
+    "mean": 0.0006509880308294669,
+    "std": 5.532112921106864e-06
+  },
+  "encode_individual_c1cnc2ccccc2n1": {
+    "mean": 0.0007200550788547844,
+    "std": 2.6031768293439643e-05
+  },
+  "encode_individual_CC(=O)SC": {
+    "mean": 0.00038307513168547305,
+    "std": 3.6430157584839564e-06
+  },
+  "encode_individual_ClC(=O)c1ccc(F)cc1": {
+    "mean": 0.0006999616604298353,
+    "std": 8.665158994301602e-06
+  },
+  "encode_joint_individual_C": {
+    "mean": 0.00015752339881146325,
+    "std": 3.829988895843682e-06
+  },
+  "encode_joint_individual_CC": {
+    "mean": 0.00021635452081682162,
+    "std": 4.1334820193090124e-06
+  },
+  "encode_joint_individual_C=C": {
+    "mean": 0.00021669374167686327,
+    "std": 3.826254642925507e-06
+  },
+  "encode_joint_individual_c1ccccc1": {
+    "mean": 0.000485027538088616,
+    "std": 2.084145264492945e-05
+  },
+  "encode_joint_individual_CCO": {
+    "mean": 0.00027307393058435993,
+    "std": 6.162956732867312e-06
+  },
+  "encode_joint_individual_CC(=O)O": {
+    "mean": 0.0003252174099907279,
+    "std": 5.294738272233337e-06
+  },
+  "encode_joint_individual_CC(=O)Oc1ccccc1C(=O)O": {
+    "mean": 0.0008901088108541444,
+    "std": 9.175962772205851e-06
+  },
+  "encode_joint_individual_O": {
+    "mean": 0.00015389336040243505,
+    "std": 4.868456906212095e-06
+  },
+  "encode_joint_individual_CN": {
+    "mean": 0.00021334479883080348,
+    "std": 6.015747537959722e-06
+  },
+  "encode_joint_individual_c1ccncc1": {
+    "mean": 0.0004977133584907279,
+    "std": 3.3289649654686715e-05
+  },
+  "encode_joint_individual_c1ccc(N)cc1": {
+    "mean": 0.0005560397770022974,
+    "std": 1.7398500710734537e-05
+  },
+  "encode_joint_individual_c1ccc2[nH]ccc2c1": {
+    "mean": 0.000691771161800716,
+    "std": 1.6749788328317513e-05
+  },
+  "encode_joint_individual_CC(=O)Nc1ccc(O)cc1": {
+    "mean": 0.0007923593305167742,
+    "std": 5.724835794824122e-05
+  },
+  "encode_joint_individual_CF": {
+    "mean": 0.0002178914620890282,
+    "std": 1.1080821622144507e-05
+  },
+  "encode_joint_individual_c1ccc(F)cc1": {
+    "mean": 0.0005458287885994651,
+    "std": 1.1500841788295994e-05
+  },
+  "encode_joint_individual_FC(F)(F)c1ccccc1": {
+    "mean": 0.0007999192425631918,
+    "std": 0.00016105960423037154
+  },
+  "encode_joint_individual_CCl": {
+    "mean": 0.0002290106494911015,
+    "std": 4.901477918826119e-05
+  },
+  "encode_joint_individual_c1ccc(Cl)cc1": {
+    "mean": 0.0005629777701687999,
+    "std": 2.3454864081252347e-05
+  },
+  "encode_joint_individual_ClC(Cl)Cl": {
+    "mean": 0.0003464400483062491,
+    "std": 1.955747835015337e-05
+  },
+  "encode_joint_individual_CBr": {
+    "mean": 0.00022032228123862298,
+    "std": 3.961448710678998e-06
+  },
+  "encode_joint_individual_c1ccc(Br)cc1": {
+    "mean": 0.0005501030304003507,
+    "std": 1.3930896420925384e-05
+  },
+  "encode_joint_individual_CI": {
+    "mean": 0.00021624763088766484,
+    "std": 4.9428260747052285e-06
+  },
+  "encode_joint_individual_c1ccc(I)cc1": {
+    "mean": 0.0005502771300962194,
+    "std": 5.2928488026581114e-05
+  },
+  "encode_joint_individual_CSC": {
+    "mean": 0.0002713883313117549,
+    "std": 5.938784900581948e-06
+  },
+  "encode_joint_individual_c1ccsc1": {
+    "mean": 0.0004336488773697056,
+    "std": 5.1126856011435254e-06
+  },
+  "encode_joint_individual_CS(C)=O": {
+    "mean": 0.0003364777303067967,
+    "std": 3.080807097740029e-05
+  },
+  "encode_joint_individual_CP(C)C": {
+    "mean": 0.00038571636658161877,
+    "std": 7.073168788368569e-05
+  },
+  "encode_joint_individual_OP(O)(O)=O": {
+    "mean": 0.000447556829021778,
+    "std": 6.501892404515025e-05
+  },
+  "encode_joint_individual_c1cc(F)c(Cl)cc1Br": {
+    "mean": 0.0008579369587823749,
+    "std": 0.00027423753013512843
+  },
+  "encode_joint_individual_c1cnc2ccccc2n1": {
+    "mean": 0.0007384309594635852,
+    "std": 2.2063093114584713e-05
+  },
+  "encode_joint_individual_CC(=O)SC": {
+    "mean": 0.0004112216184148565,
+    "std": 5.1886752172687746e-05
+  },
+  "encode_joint_individual_ClC(=O)c1ccc(F)cc1": {
+    "mean": 0.0007176857479498722,
+    "std": 3.714380265043715e-05
+  },
+  "encode_batch_all": {
+    "mean": 0.010412455140030943,
+    "std": 0.0014365977816308397
+  },
+  "encode_joint_batch_all": {
+    "mean": 0.01062497304053977,
+    "std": 0.0024564952144335473
+  }
+}

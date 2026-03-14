@@ -1,115 +1,125 @@
 """
-Low-level utilities: TupleIndexer, scatter_hd, cartesian_bind_tensor.
-
-These are adapted from graph_hdc and will eventually be replaced with
-a pure-NumPy implementation once the PyTorch dependency is removed.
+Low-level utilities: TupleIndexer, scatter_hd, HRR algebra helpers.
 """
 
 from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Union
 
-import torch
-import torchhd
-from torch import Tensor
-from torchhd import HRRTensor
+import numpy as np
+
+
+# ───────────────────── Graph data structures ─────────────────────
+
+
+@dataclass
+class GraphData:
+    """Minimal graph representation for a single molecule."""
+    x: np.ndarray          # [N, 5]
+    edge_index: np.ndarray  # [2, E]
+
+
+@dataclass
+class GraphBatch:
+    """Batched graph representation for multiple molecules."""
+    x: np.ndarray          # [total_N, 5]
+    edge_index: np.ndarray  # [2, total_E]
+    batch: np.ndarray      # [total_N]
+
+
+def batch_from_data_list(data_list: list[GraphData]) -> GraphBatch:
+    """Concatenate a list of GraphData into a single GraphBatch."""
+    xs = []
+    edge_indices = []
+    batch_indices = []
+    node_offset = 0
+
+    for i, data in enumerate(data_list):
+        num_nodes = data.x.shape[0]
+        xs.append(data.x)
+
+        if data.edge_index.shape[1] > 0:
+            edge_indices.append(data.edge_index + node_offset)
+        else:
+            edge_indices.append(data.edge_index)
+
+        batch_indices.append(np.full(num_nodes, i, dtype=np.int64))
+        node_offset += num_nodes
+
+    return GraphBatch(
+        x=np.concatenate(xs, axis=0) if xs else np.empty((0, 5), dtype=np.float64),
+        edge_index=np.concatenate(edge_indices, axis=1) if edge_indices else np.empty((2, 0), dtype=np.int64),
+        batch=np.concatenate(batch_indices) if batch_indices else np.empty(0, dtype=np.int64),
+    )
+
+
+# ───────────────────── HRR algebra ─────────────────────
+
+
+def hrr_identity(n: int, d: int) -> np.ndarray:
+    """HRR identity vectors: ``[n, d]`` with ``[:,0] = 1``, rest zero."""
+    out = np.zeros((n, d), dtype=np.float64)
+    out[:, 0] = 1.0
+    return out
+
+
+def hrr_bind(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """HRR binding via circular convolution (element-wise FFT multiply)."""
+    return np.real(np.fft.ifft(np.fft.fft(a) * np.fft.fft(b)))
+
+
+def hrr_multibundle(x: np.ndarray) -> np.ndarray:
+    """HRR bundling: sum along the second-to-last axis."""
+    return np.sum(x, axis=-2)
+
+
+# ───────────────────── Scatter ─────────────────────
 
 
 def scatter_hd(
-    src: Tensor,
-    index: Tensor,
+    src: np.ndarray,
+    index: np.ndarray,
     *,
     op: str,
     dim_size: int | None = None,
-) -> Tensor:
+) -> np.ndarray:
     """Scatter-reduce hypervectors along dim=0.
 
     Parameters
     ----------
-    src : Tensor
+    src : np.ndarray
         Hypervector batch ``[N, D]``.
-    index : Tensor
+    index : np.ndarray
         Bucket indices ``[N]``.
     op : str
         ``"bundle"`` (element-wise sum) or ``"bind"`` (element-wise product).
     dim_size : int, optional
         Number of output buckets.
     """
-    from torch_geometric.utils import scatter
+    d = src.shape[-1]
 
-    index = index.to(src.device, dtype=torch.long, non_blocking=True)
-
-    if index.numel() == 0:
+    if index.size == 0:
         if dim_size is None:
             dim_size = 1
-        return torchhd.identity(
-            num_vectors=dim_size,
-            dimensions=src.shape[-1],
-            vsa="HRR",
-            device=src.device,
-        )
+        return hrr_identity(dim_size, d)
 
     if dim_size is None:
-        dim_size = int(index.max().item()) + 1
+        dim_size = int(index.max()) + 1
 
-    if isinstance(src, HRRTensor) and op == "bundle":
-        reduce = "sum"
-    elif op == "bundle":
-        reduce = "sum"
-    else:
-        reduce = "mul"
+    if op == "bundle":
+        out = np.zeros((dim_size, d), dtype=np.float64)
+        np.add.at(out, index, src)
+    else:  # bind
+        out = hrr_identity(dim_size, d)
+        np.multiply.at(out, index, src)
 
-    idx_dim = int(index.max().item()) + 1
-    result = scatter(src, index, dim=0, dim_size=idx_dim, reduce=reduce)
-
-    if (num_identity := dim_size - idx_dim) > 0:
-        identities = torchhd.identity(
-            num_vectors=num_identity,
-            dimensions=src.shape[-1],
-            vsa="HRR",
-            device=src.device,
-        )
-        result = torch.cat([result, identities])
-
-    return result
+    return out
 
 
-def cartesian_bind_tensor(tensors: list[Tensor]) -> Tensor:
-    """Cartesian product of hypervector sets, bound together.
-
-    Parameters
-    ----------
-    tensors : list[Tensor]
-        Each ``[Ni, D]``.
-
-    Returns
-    -------
-    Tensor
-        ``[N1*N2*..., D]``
-    """
-    tensors = [t for t in tensors if t is not None]
-    if not tensors:
-        raise ValueError("Need at least one set")
-
-    if len(tensors) == 1:
-        t = tensors[0]
-        return t.unsqueeze(-1) if t.dim() == 1 else t
-
-    sizes = [t.shape[0] for t in tensors]
-    idx_grids = torch.cartesian_prod(
-        *[torch.arange(n, device=tensors[0].device) for n in sizes]
-    )
-
-    hv_list = []
-    for k, t in enumerate(tensors):
-        idxs = idx_grids[:, k]
-        hv = t[idxs] if t.dim() != 1 else t[idxs].unsqueeze(-1)
-        hv_list.append(hv)
-
-    stacked = torch.stack(hv_list, dim=1)
-    return torchhd.multibind(stacked)
+# ───────────────────── TupleIndexer ─────────────────────
 
 
 class TupleIndexer:

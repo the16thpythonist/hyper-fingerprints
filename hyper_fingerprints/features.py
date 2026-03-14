@@ -1,5 +1,5 @@
 """
-Molecular feature extraction: SMILES / RDKit Mol -> PyG Data.
+Molecular feature extraction: SMILES / RDKit Mol -> GraphData.
 
 Fixed 5-feature scheme per atom:
   [atom_type_idx, degree, formal_charge, total_Hs, is_aromatic]
@@ -17,9 +17,10 @@ Feature bins:
 
 from __future__ import annotations
 
-import torch
+import numpy as np
 from rdkit import Chem
-from torch_geometric.data import Data
+
+from hyper_fingerprints.utils import GraphData
 
 DEFAULT_ATOM_TYPES: list[str] = ["Br", "C", "Cl", "F", "I", "N", "O", "P", "S"]
 
@@ -43,8 +44,8 @@ def feature_bins(atom_types: list[str]) -> list[int]:
 def mol_to_data(
     mol: Chem.Mol,
     atom_to_idx: dict[str, int],
-) -> Data:
-    """Convert an RDKit molecule to a PyG Data object.
+) -> GraphData:
+    """Convert an RDKit molecule to a GraphData object.
 
     Parameters
     ----------
@@ -56,8 +57,8 @@ def mol_to_data(
 
     Returns
     -------
-    Data
-        PyG Data with ``x`` of shape ``[num_atoms, 5]`` and ``edge_index``.
+    GraphData
+        GraphData with ``x`` of shape ``[num_atoms, 5]`` and ``edge_index``.
 
     Raises
     ------
@@ -86,7 +87,12 @@ def mol_to_data(
         src += [i, j]
         dst += [j, i]
 
-    return Data(
-        x=torch.tensor(x, dtype=torch.float32),
-        edge_index=torch.tensor([src, dst], dtype=torch.long),
+    if src:
+        edge_index = np.array([src, dst], dtype=np.int64)
+    else:
+        edge_index = np.empty((2, 0), dtype=np.int64)
+
+    return GraphData(
+        x=np.array(x, dtype=np.float64),
+        edge_index=edge_index,
     )
