@@ -1,5 +1,7 @@
 # Hyper Fingerprints
 
+![banner](banner.png)
+
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![NumPy only](https://img.shields.io/badge/backend-numpy-orange)
