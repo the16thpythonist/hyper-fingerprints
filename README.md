@@ -57,8 +57,7 @@ pip install .
 ## 🚀 Quick start
 
 ```python
-from hyper_fingerprints import Encoder
-import numpy as np
+from hyper_fingerprints import Encoder, cosine_similarity
 
 enc = Encoder(dimension=512, seed=42)
 
@@ -66,8 +65,7 @@ enc = Encoder(dimension=512, seed=42)
 fps = enc.encode(["CCO", "CO", "c1ccccc1"])  # shape: (3, 512), dtype: float64
 
 # Cosine similarity — similar molecules get similar vectors
-norms = np.linalg.norm(fps, axis=1, keepdims=True)
-sim = (fps / norms) @ (fps / norms).T
+sim = cosine_similarity(fps, fps)
 
 print(f"ethanol vs methanol: {sim[0, 1]:.3f}")   # high similarity
 print(f"ethanol vs benzene:  {sim[0, 2]:.3f}")    # low similarity

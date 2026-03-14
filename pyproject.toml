@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "bump-my-version",
     "nox",
     "pytest>=7.0",
     "pytest-cov",
@@ -19,6 +20,14 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = false
+tag = false
+
+[[tool.bumpversion.files]]
+filename = "hyper_fingerprints/VERSION"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

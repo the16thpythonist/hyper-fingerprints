@@ -7,9 +7,17 @@ from __future__ import annotations
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Union
 
 import numpy as np
+
+_VERSION_FILE = Path(__file__).parent / "VERSION"
+
+
+def get_version() -> str:
+    """Read and return the version string from the VERSION file."""
+    return _VERSION_FILE.read_text().strip()
 
 
 # ───────────────────── Graph data structures ─────────────────────
