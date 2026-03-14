@@ -1,4 +1,4 @@
-# Hyper Fingerprints
+# Hyperdimensional Fingerprints (HDF)
 
 ![banner](banner.png)
 
@@ -43,12 +43,8 @@ Hyper Fingerprints takes a different approach:
 
 Requires Python 3.9+.
 
-Install from source:
-
 ```bash
-git clone <repo-url>
-cd hyper-fingerprints
-pip install .
+pip install git+https://github.com/the16thpythonist/hyper-fingerprints.git
 ```
 
 ### Dependencies
