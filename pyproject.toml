@@ -1,6 +1,6 @@
 [project]
 name = "hyper_fingerprints"
-version = "0.2.1"
+version = "0.2.2"
 description = "Hyperdimensional molecular fingerprints using Vector Symbolic Architectures"
 requires-python = ">=3.9"
 license = "MIT"
@@ -25,7 +25,7 @@ build-backend = "maturin"
 module-name = "hyper_fingerprints._core"
 
 [tool.bumpversion]
-current_version = "0.2.1"
+current_version = "0.2.2"
 commit = false
 tag = false
 
