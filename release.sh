@@ -13,7 +13,8 @@
 #   4. Commits the version bump
 #   5. Creates a git tag (v0.2.0 etc.)
 #   6. Pushes the commit and tag to origin
-#   7. GitHub Actions CI then automatically builds all platform wheels
+#   7. Creates a GitHub release (triggers Zenodo archival)
+#   8. GitHub Actions CI then automatically builds all platform wheels
 #      and publishes to PyPI
 
 set -euo pipefail
@@ -38,7 +39,7 @@ echo "============================================"
 echo ""
 
 # --- Step 1: Check clean working directory ---
-echo "[1/6] Checking working directory..."
+echo "[1/7] Checking working directory..."
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "  ERROR: working directory is not clean. Commit or stash changes first."
     echo ""
@@ -49,7 +50,7 @@ echo "  OK — working directory is clean."
 echo ""
 
 # --- Step 2: Build and test ---
-echo "[2/6] Building wheel and running test suite (nox -s build_test)..."
+echo "[2/7] Building wheel and running test suite (nox -s build_test)..."
 echo "  This builds a release wheel, installs it in a clean venv,"
 echo "  and runs all tests against it."
 echo ""
@@ -64,7 +65,7 @@ echo "  All tests passed."
 echo ""
 
 # --- Step 3: Bump version ---
-echo "[3/6] Bumping version ($PART)..."
+echo "[3/7] Bumping version ($PART)..."
 echo "  Current version: $(cat hyper_fingerprints/VERSION)"
 bump-my-version bump "$PART"
 NEW_VERSION="$(cat hyper_fingerprints/VERSION)"
@@ -73,14 +74,14 @@ echo "  New version:     $NEW_VERSION"
 echo ""
 
 # --- Step 4: Commit version bump ---
-echo "[4/6] Committing version bump..."
+echo "[4/7] Committing version bump..."
 git add -A
 git commit -m "Bump version to $NEW_VERSION"
 echo "  Committed."
 echo ""
 
 # --- Step 5: Tag ---
-echo "[5/6] Creating tag $TAG..."
+echo "[5/7] Creating tag $TAG..."
 if git rev-parse "$TAG" &>/dev/null; then
     echo "  ERROR: tag $TAG already exists!"
     exit 1
@@ -90,9 +91,15 @@ echo "  Tagged."
 echo ""
 
 # --- Step 6: Push ---
-echo "[6/6] Pushing to origin..."
+echo "[6/7] Pushing to origin..."
 git push origin master --tags
 echo "  Pushed."
+echo ""
+
+# --- Step 7: Create GitHub release (triggers Zenodo) ---
+echo "[7/7] Creating GitHub release..."
+gh release create "$TAG" --title "$TAG" --notes "Release $NEW_VERSION"
+echo "  GitHub release created."
 echo ""
 
 echo "============================================"
@@ -101,6 +108,8 @@ echo "============================================"
 echo ""
 echo "  CI will now build wheels for all platforms"
 echo "  and publish to PyPI."
+echo ""
+echo "  Zenodo will archive this release and mint a DOI."
 echo ""
 echo "  Watch progress:"
 echo "  https://github.com/the16thpythonist/hyper-fingerprints/actions"
