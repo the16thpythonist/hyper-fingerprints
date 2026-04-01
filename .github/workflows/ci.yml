@@ -66,9 +66,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
-          # sccache: cache Rust compilation between runs (not on tag builds
-          # because those should be clean builds)
+          # -i python3.11: tell maturin which interpreter to use inside the
+          # manylinux container so it produces abi3 wheels (not cp38)
+          args: --release --out dist -i python3.11
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
 
