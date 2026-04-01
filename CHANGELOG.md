@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] - 2026-04-01
+
+### Fixed
+
+- CI: pass `-i python3.11` to maturin in manylinux builds to produce correct
+  `abi3` wheel tags (was producing `cp38` wheels due to container default Python)
+- CI: use `macos-latest` for macOS x86_64 builds (`macos-13` runner unavailable)
+
 ## [0.2.0] - 2026-04-01
 
 ### Added
