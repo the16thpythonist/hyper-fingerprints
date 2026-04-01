@@ -1,0 +1,55 @@
+{
+    "title": "Hyperdimensional Fingerprints (HDF): Hyperdimensional Molecular Fingerprints using Vector Symbolic Architectures",
+    "upload_type": "software",
+    "access_right": "open",
+    "license": "MIT",
+    "version": "0.2.1",
+    "language": "eng",
+    "creators": [
+        {
+            "name": "Teufel, Jonas",
+            "affiliation": "Karlsruhe Institute of Technology (KIT)",
+            "orcid": "0000-0002-9228-9395"
+        },
+        {
+            "name": "Torresi, Luca",
+            "affiliation": "Karlsruhe Institute of Technology (KIT)",
+            "orcid": "0000-0003-2205-6753"
+        },
+        {
+            "name": "Eberhard, André",
+            "affiliation": "Karlsruhe Institute of Technology (KIT)"
+        },
+        {
+            "name": "Kaveh, Arvand",
+            "affiliation": "Karlsruhe Institute of Technology (KIT)"
+        }
+    ],
+    "description": "Real-valued, fixed-size molecular fingerprints using Holographic Reduced Representations (HRR) with graph message passing. Encodes molecules into continuous vector representations that work as drop-in feature vectors for similarity search, clustering, or downstream ML tasks.",
+    "keywords": [
+        "molecular fingerprints",
+        "hyperdimensional computing",
+        "vector symbolic architectures",
+        "holographic reduced representations",
+        "cheminformatics",
+        "rdkit",
+        "machine learning"
+    ],
+    "related_identifiers": [
+        {
+            "identifier": "10.1109/72.377968",
+            "relation": "cites",
+            "scheme": "doi"
+        },
+        {
+            "identifier": "10.1007/s12559-009-9009-8",
+            "relation": "cites",
+            "scheme": "doi"
+        },
+        {
+            "identifier": "https://github.com/the16thpythonist/hyper-fingerprints",
+            "relation": "isSupplementTo",
+            "scheme": "url"
+        }
+    ]
+}

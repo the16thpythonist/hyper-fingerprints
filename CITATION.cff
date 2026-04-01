@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+title: "Hyperdimensional Fingerprints (HDF): Hyperdimensional Molecular Fingerprints using Vector Symbolic Architectures"
+version: 0.2.1
+license: MIT
+type: software
+abstract: "Real-valued, fixed-size molecular fingerprints using Holographic Reduced Representations (HRR) with graph message passing. Encodes molecules into continuous vector representations that work as drop-in feature vectors for similarity search, clustering, or downstream ML tasks."
+message: "If you use this software, please cite it using these metadata."
+authors:
+  - given-names: Jonas
+    family-names: Teufel
+    affiliation: "Karlsruhe Institute of Technology (KIT)"
+    orcid: "https://orcid.org/0000-0002-9228-9395"
+  - given-names: Luca
+    family-names: Torresi
+    affiliation: "Karlsruhe Institute of Technology (KIT)"
+    orcid: "https://orcid.org/0000-0003-2205-6753"
+  - given-names: André
+    family-names: Eberhard
+    affiliation: "Karlsruhe Institute of Technology (KIT)"
+  - given-names: Arvand
+    family-names: Kaveh
+    affiliation: "Karlsruhe Institute of Technology (KIT)"
+keywords:
+  - molecular fingerprints
+  - hyperdimensional computing
+  - vector symbolic architectures
+  - holographic reduced representations
+  - cheminformatics
+  - rdkit
+  - machine learning
+repository-code: "https://github.com/the16thpythonist/hyper-fingerprints"

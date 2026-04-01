@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] - 2026-04-01
+
+### Added
+
+- `.zenodo.json` metadata file for Zenodo DOI archival
+- `CITATION.cff` for GitHub's "Cite this repository" button
+
 ## [0.2.1] - 2026-04-01
 
 ### Fixed
