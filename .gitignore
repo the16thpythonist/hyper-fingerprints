@@ -6,3 +6,5 @@ build/
 .venv/
 .nox/
 .pytest_cache/
+target/
+*.so

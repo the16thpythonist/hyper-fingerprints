@@ -1,0 +1,201 @@
+# CI: build wheels for all platforms, run tests, publish to PyPI on tags.
+#
+# How it works:
+#
+# 1. TRIGGERS:
+#    - Push to master: builds wheels + runs tests (no publish)
+#    - Pull request:   builds wheels + runs tests (no publish)
+#    - Tag push (v*):  builds wheels + runs tests + publishes to PyPI
+#    - Manual trigger: builds wheels + runs tests (optionally publish)
+#
+# 2. BUILD JOBS (linux, macos, windows):
+#    Each uses PyO3/maturin-action which:
+#    - Installs Rust + maturin inside the runner
+#    - For Linux: runs inside a manylinux Docker container (glibc compat)
+#    - For macOS/Windows: builds natively on the runner
+#    - Produces an abi3 wheel (one wheel per platform, all Python 3.9+)
+#    - Uploads the wheel as a GitHub Actions artifact
+#
+# 3. TEST JOB:
+#    Downloads the Linux x86_64 wheel, installs it in a fresh venv,
+#    and runs the full pytest suite. This catches packaging issues
+#    (missing files, broken imports, etc.)
+#
+# 4. RELEASE JOB (tag pushes only):
+#    Downloads all wheel artifacts + sdist, publishes to PyPI.
+#    Uses PyPI trusted publishing (OIDC) -- no API token needed.
+#    Set up at: https://pypi.org/manage/project/.../settings/publishing/
+#
+# Prerequisites for PyPI publishing:
+#    1. Create the project on PyPI
+#    2. Add a "trusted publisher" for this GitHub repo:
+#       - Owner: <github-user>
+#       - Repository: hyper-fingerprints
+#       - Workflow: ci.yml
+#       - Environment: release
+#    3. Push a tag: git tag v0.1.0 && git push origin v0.1.0
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Build Linux wheels (manylinux, x86_64 + aarch64)
+  # -----------------------------------------------------------------------
+  linux:
+    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-22.04' || 'ubuntu-22.04' }}
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          # sccache: cache Rust compilation between runs (not on tag builds
+          # because those should be clean builds)
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: auto
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  # -----------------------------------------------------------------------
+  # Build macOS wheels (x86_64 + arm64 natively)
+  # -----------------------------------------------------------------------
+  macos:
+    runs-on: ${{ matrix.target == 'x86_64' && 'macos-13' || 'macos-latest' }}
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  # -----------------------------------------------------------------------
+  # Build Windows wheels (x86_64)
+  # -----------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  # -----------------------------------------------------------------------
+  # Build source distribution
+  # -----------------------------------------------------------------------
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # -----------------------------------------------------------------------
+  # Test: install the Linux wheel and run pytest
+  # -----------------------------------------------------------------------
+  test:
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Download Linux x86_64 wheel
+        uses: actions/download-artifact@v7
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+
+      - name: Install wheel and test dependencies
+        run: |
+          pip install dist/hyper_fingerprints-*.whl
+          pip install pytest pytest-cov
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # -----------------------------------------------------------------------
+  # Publish to PyPI (only on tag push)
+  # -----------------------------------------------------------------------
+  release:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows, sdist, test]
+    environment: release
+    permissions:
+      id-token: write  # required for trusted publishing
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

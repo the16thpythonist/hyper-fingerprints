@@ -1,0 +1,17 @@
+[package]
+name = "hyper_fingerprints_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
+numpy = "0.28"
+ndarray = "0.17"
+purr = "0.9"
+realfft = "3.5"
+num-complex = "0.4"
+rayon = "1.10"

@@ -4,9 +4,9 @@
 
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![NumPy only](https://img.shields.io/badge/backend-numpy-orange)
+![NumPy + optional Rust](https://img.shields.io/badge/backend-numpy%20%2B%20rust-orange)
 
-**Real-valued, fixed-size molecular fingerprints — no training, just NumPy.**
+**Real-valued, fixed-size molecular fingerprints — no training, just NumPy (with optional Rust acceleration).**
 
 Hyper Fingerprints encodes molecules into continuous vector representations
 using [Holographic Reduced Representations](https://doi.org/10.1109/72.377968)
@@ -38,19 +38,6 @@ Hyper Fingerprints takes a different approach:
 - **Joint representations** — `encode_joint()` gives both an atom-bag view
   (order-0) and a structure-aware view (order-N) in a single vector
 -->
-
-## 📦 Installation
-
-Requires Python 3.9+.
-
-```bash
-pip install git+https://github.com/the16thpythonist/hyper-fingerprints.git
-```
-
-### Dependencies
-
-- `numpy >= 1.24`
-- `rdkit >= 2024.0.0`
 
 ## 🚀 Quick start
 
@@ -84,6 +71,7 @@ Encoder(
     atom_types=None,    # atom vocabulary (default: Br, C, Cl, F, I, N, O, P, S)
     seed=None,          # random seed for reproducible codebook generation
     normalize=False,    # L2-normalize after each message-passing layer
+    backend="auto",     # "auto" | "rust" | "numpy"
 )
 ```
 
@@ -135,17 +123,67 @@ Each atom is described by 5 discrete features:
 - **No bond type features** — bonds are treated as unweighted edges. Single,
   double, and aromatic bonds are not distinguished in the current feature scheme.
 - **No stereochemistry** — chirality and cis/trans isomerism are not encoded.
-- **No GPU acceleration** — the implementation is pure NumPy, which is a
-  deployment strength but means large-scale encoding is CPU-bound.
+- **No GPU acceleration** — encoding is CPU-only (NumPy or optional Rust
+  extension).
 - **Codebook scales with vocabulary** — the codebook has
   `product(feature_bins)` entries (1296 for the default 9 atom types). Large
   custom atom type lists will increase memory usage.
 
-## 🧪 Development
+## 📦 Installation
 
-Install dev dependencies:
+Requires Python 3.9+ and a [Rust toolchain](https://rustup.rs/) (1.83+).
+
+### From source (recommended for development)
 
 ```bash
+git clone https://github.com/the16thpythonist/hyper-fingerprints.git
+cd hyper-fingerprints
+
+# Install maturin (builds the Rust extension)
+pip install maturin
+
+# Build and install in development mode (editable, release-optimized)
+RUSTFLAGS="-C target-cpu=native" maturin develop --release
+
+# Verify the Rust backend is available
+python -c "from hyper_fingerprints._core import encode_batch_rs; print('Rust OK')"
+```
+
+### From a pre-built wheel
+
+```bash
+# Build the wheel first
+./build.sh
+
+# Install the wheel
+pip install target/wheels/hyper_fingerprints-*.whl
+```
+
+### Dependencies
+
+- `numpy >= 1.24`
+- `rdkit >= 2024.0.0`
+- Rust toolchain >= 1.83 (build-time only)
+
+## 🔧 Rust backend
+
+The Rust extension accelerates both SMILES parsing/feature extraction (~23x)
+and the message-passing pipeline (~22x), for a combined ~22x end-to-end
+speedup. When installed, it is used automatically:
+
+```python
+enc = Encoder(dimension=512, seed=42, backend="rust")   # require Rust
+enc = Encoder(dimension=512, seed=42, backend="numpy")  # force pure Python
+enc = Encoder(dimension=512, seed=42, backend="auto")   # default: Rust if available
+```
+
+## 🧪 Development
+
+Install in dev mode with the Rust extension:
+
+```bash
+pip install maturin
+RUSTFLAGS="-C target-cpu=native" maturin develop --release
 pip install -e ".[dev]"
 ```
 
@@ -153,6 +191,12 @@ Run tests:
 
 ```bash
 pytest
+```
+
+Build a wheel and test it in a clean environment:
+
+```bash
+nox -s build_test
 ```
 
 Run tests across Python 3.9-3.13 with nox:

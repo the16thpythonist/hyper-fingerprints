@@ -37,11 +37,15 @@ class FeatureEncoder:
         cb = cb / norms
         return cb
 
-    def encode(self, data: np.ndarray) -> np.ndarray:
-        """Encode feature tuples ``[N, F]`` into hypervectors ``[N, D]``."""
+    def encode_indices(self, data: np.ndarray) -> np.ndarray:
+        """Map feature tuples ``[N, F]`` to flat codebook indices ``[N]``."""
         data = data.astype(np.int64)
         if data.ndim == 1:
             data = data[:, np.newaxis]
         tup = list(map(tuple, data.tolist()))
-        idxs = self.indexer.get_idxs(tup)
+        return np.array(self.indexer.get_idxs(tup), dtype=np.int64)
+
+    def encode(self, data: np.ndarray) -> np.ndarray:
+        """Encode feature tuples ``[N, F]`` into hypervectors ``[N, D]``."""
+        idxs = self.encode_indices(data)
         return self.codebook[idxs]

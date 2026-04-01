@@ -18,8 +18,11 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "hyper_fingerprints._core"
 
 [tool.bumpversion]
 current_version = "0.1.0"
