@@ -56,6 +56,12 @@ print(f"ethanol vs methanol: {sim[0, 1]:.3f}")   # high similarity
 print(f"ethanol vs benzene:  {sim[0, 2]:.3f}")    # low similarity
 ```
 
+To use a custom atom vocabulary, pass `atom_types` at init:
+
+```python
+enc = Encoder(dimension=512, atom_types=["C", "N", "O", "H", "Si"])
+```
+
 See [`examples/00_quickstart.ipynb`](examples/00_quickstart.ipynb) for a full
 walkthrough covering similarity search, joint fingerprints, custom atom types,
 save/load, and scikit-learn integration.
