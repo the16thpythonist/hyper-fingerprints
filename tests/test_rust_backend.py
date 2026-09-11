@@ -50,14 +50,19 @@ def _make_encoder(config, codebook, backend):
 # ---------------------------------------------------------------------------
 
 
-class TestCrossBackendRegression:
-    """Both backends must match the recorded regression fixtures."""
+@pytest.fixture(scope="module")
+def fixture_data():
+    if not FIXTURE_PATH.exists():
+        pytest.skip("Regression fixtures not found.")
+    return _load_fixture()
 
-    @pytest.fixture(scope="class")
-    def fixture_data(self):
-        if not FIXTURE_PATH.exists():
-            pytest.skip("Regression fixtures not found.")
-        return _load_fixture()
+
+class TestCrossBackendRegression:
+    """Both backends must match the recorded regression fixtures.
+
+    ``test_regression.py`` runs with ``backend="auto"`` (Rust when built), so
+    the ``[numpy]`` leg here is the only fixture check of the NumPy path.
+    """
 
     @pytest.mark.parametrize("backend", BACKENDS)
     def test_individual_encode(self, fixture_data, backend):
@@ -108,7 +113,22 @@ class TestCrossBackendRegression:
 class TestRustVsPython:
     """Rust and Python backends must produce identical results."""
 
-    SMILES = ["CCO", "c1ccccc1", "CC(=O)O", "CC(=O)Nc1ccc(O)cc1", "c1ccncc1"]
+    # Includes Kekulé spellings: the Rust parser does not perceive
+    # aromaticity, so these must be aromatized before reaching it.
+    SMILES = [
+        "CCO", "c1ccccc1", "CC(=O)O", "CC(=O)Nc1ccc(O)cc1", "c1ccncc1",
+        "C1=CC=CC=C1", "C1=CC=CN=C1", "O1C=CC=C1", "O=C1C=CC(=O)C=C1",
+    ]
+
+    def test_kekule_smiles_matches_aromatic_and_mol(self):
+        enc = Encoder(dimension=256, depth=2, seed=42, backend="rust")
+        pairs = [("C1=CC=CC=C1", "c1ccccc1"), ("C1=CC=CN=C1", "c1ccncc1"), ("O1C=CC=C1", "c1ccoc1")]
+        for kekule, aromatic in pairs:
+            from_kekule = enc.encode(kekule)
+            np.testing.assert_allclose(from_kekule, enc.encode(aromatic), atol=ATOL, rtol=0)
+            np.testing.assert_allclose(
+                from_kekule, enc.encode(Chem.MolFromSmiles(kekule)), atol=ATOL, rtol=0
+            )
 
     @pytest.mark.parametrize("dim", [128, 256, 512])
     @pytest.mark.parametrize("depth", [1, 2, 3])
@@ -215,6 +235,28 @@ class TestEdgeCases:
     def test_charged_molecule(self):
         """Molecule with formal charges."""
         self._assert_backends_match("[NH4+].[Cl-]", atom_types=["N", "Cl", "H"])
+
+    @pytest.mark.parametrize("features", [
+        ["element"],
+        ["element", "degree"],
+        ["element", "aromatic", "charge"],
+        ["degree", "hydrogens", "aromatic"],
+    ])
+    def test_reduced_feature_lists(self, features):
+        """The Rust parser dispatches extractors by name; every subset must match."""
+        smiles = ["CCO", "c1ccccc1", "CC(=O)[O-]", "C[N+](C)(C)C", "c1cc[nH]c1"]
+        self._assert_backends_match(smiles, features=features)
+
+    def test_feature_unsupported_by_rust_parser(self):
+        """A legacy feature the Rust SMILES parser lacks falls back to RDKit
+        preparation (Rust still does the message passing); SMILES and Mol
+        input must agree with the pure-NumPy result."""
+        features = ["element", "implicit_hydrogens", "aromatic"]
+        smiles = ["CCO", "c1cc[nH]c1", "CC(=O)N"]
+        rs = self._assert_backends_match(smiles, features=features)
+        enc_rs = Encoder(dimension=128, depth=2, seed=42, backend="rust", features=features)
+        from_mol = enc_rs.encode([Chem.MolFromSmiles(smi) for smi in smiles])
+        np.testing.assert_allclose(from_mol, rs, atol=ATOL, rtol=0)
 
     def test_determinism_across_runs(self):
         """Multiple calls with same input must give identical results."""

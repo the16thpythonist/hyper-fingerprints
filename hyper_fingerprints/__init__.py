@@ -4,6 +4,12 @@ import numpy as np
 
 from hyper_fingerprints.encoder import Encoder
 from hyper_fingerprints.features import DEFAULT_ATOM_TYPES, DEFAULT_FEATURES
+from hyper_fingerprints.presets import (
+    FEATURES_CONTINUOUS,
+    FEATURES_DEFAULT,
+    FEATURES_GRAPH_HDC,
+    GRAPH_FEATURES_GRAPH_HDC,
+)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -29,4 +35,13 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return a @ b.T
 
 
-__all__ = ["Encoder", "DEFAULT_ATOM_TYPES", "DEFAULT_FEATURES", "cosine_similarity"]
+__all__ = [
+    "Encoder",
+    "DEFAULT_ATOM_TYPES",
+    "DEFAULT_FEATURES",
+    "FEATURES_DEFAULT",
+    "FEATURES_CONTINUOUS",
+    "FEATURES_GRAPH_HDC",
+    "GRAPH_FEATURES_GRAPH_HDC",
+    "cosine_similarity",
+]

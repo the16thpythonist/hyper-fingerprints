@@ -124,13 +124,85 @@ Each atom is described by 5 discrete features:
 | Total Hs | 4 | 0-3 |
 | Is aromatic | 2 | 0, 1 |
 
+## 🌊 Continuous features (FHRR)
+
+Passing `features` as a **dict** switches to the composite encoder: every
+feature gets its own codebook, and the per-feature hypervectors are bound
+together with circular convolution. Count-like features can then be encoded
+**continuously** via Fourier Holographic Reduced Representations, so that
+degree 3 is close to degree 4 rather than orthogonal to it:
+
+```python
+from hyper_fingerprints import Encoder, FEATURES_CONTINUOUS, GRAPH_FEATURES_GRAPH_HDC
+
+enc = Encoder(dimension=1024, seed=42, features=FEATURES_CONTINUOUS, normalize=True)
+fps = enc.encode(["CCCC", "CCCCC", "c1ccccc1"])
+```
+
+`FEATURES_CONTINUOUS` expands to
+
+```python
+{
+    "element":   {"kind": "categorical"},
+    "degree":    {"kind": "continuous", "bandwidth": 2.0},
+    "hydrogens": {"kind": "continuous", "bandwidth": 2.0},
+    "charge":    {"kind": "categorical"},
+    "aromatic":  {"kind": "categorical"},
+}
+```
+
+A continuous value `v` is encoded as `ifft(spectrum ** (v / bandwidth))`;
+`bandwidth` sets how far apart two values must be before their vectors stop
+resembling each other. Any built-in feature (`element`, `degree`, `charge`,
+`hydrogens`, `implicit_hydrogens`, `aromatic`) can be used with either kind;
+`seed_offset` (default `10 * position`) decorrelates the per-feature codebooks.
+
+Other presets: `FEATURES_GRAPH_HDC` / `GRAPH_FEATURES_GRAPH_HDC` mirror the
+configuration of the [graph_hdc](https://github.com/the16thpythonist/graph_hdc)
+project; `FEATURES_DEFAULT` is the legacy list.
+
+**Graph-level features** (`graph_size`, `graph_diameter`, `graph_total_charge`)
+can be added with `graph_features=` and enter the fingerprint according to
+`graph_mode`:
+
+| `graph_mode` | Result |
+|:-------------|:-------|
+| `"bundle"` (default) | `normalize(normalize(emb) + normalize(graph_hv))` — graph_hdc convention |
+| `"bind"` | `emb ⊛ graph_hv` |
+| `"concat"` | `[emb | graph_hv]`, output has `2 * dimension` columns |
+
+Further options: `bidirectional=False` uses a single directed edge per bond
+(graph_hdc's default), `unknown_atoms="slot"` maps atoms outside `atom_types`
+to a shared extra codebook row instead of raising.
+
+Recommendation: use `normalize=True` with continuous features; without
+per-layer normalization the FHRR magnitudes compound across message-passing
+layers.
+
+### Importing a graph_hdc codebook
+
+```python
+# in graph_hdc
+hyper_net.export_legacy_codebook("codebook.npz")
+
+# in hyper_fingerprints -- identical embeddings, no torch required
+enc = Encoder.from_legacy_codebook("codebook.npz")
+```
+
+The composite encoder currently runs on the NumPy backend only.
+
 ## ⚠️ Limitations
 
 - **No bond type features** — bonds are treated as unweighted edges. Single,
   double, and aromatic bonds are not distinguished in the current feature scheme.
 - **No stereochemistry** — chirality and cis/trans isomerism are not encoded.
 - **No GPU acceleration** — encoding is CPU-only (NumPy or optional Rust
-  extension).
+  extension). The Rust backend does not yet cover the composite / continuous
+  encoder.
+- **Legacy single-atom batching quirk** — in the default (list-features)
+  mode, a single-atom molecule such as `C` or `O` encodes differently alone
+  than in a batch with bonded molecules. Kept for output stability; the
+  composite (dict-features) encoder is batch-invariant.
 - **Codebook scales with vocabulary** — the codebook has
   `product(feature_bins)` entries (1296 for the default 9 atom types). Large
   custom atom type lists will increase memory usage.

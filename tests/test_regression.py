@@ -6,8 +6,12 @@ changes the numerical output of the encoder, these tests will fail — which is
 the point: any behavioural change must be deliberate and the fixtures
 regenerated explicitly.
 
-Fixtures are stored as framework-agnostic ``.npz`` files (numpy arrays) so
-they remain valid after replacing torch/torchhd with a different backend.
+Fixtures are stored as framework-agnostic ``.npz`` files (numpy arrays).
+
+Note: the recorded codebook is *injected* into the encoder under test, so
+``regression_data.npz`` protects the message-passing pipeline only. The
+seed -> codebook generation of both encoder modes is protected separately by
+``seed_fixtures.npz`` (see ``TestSeedFixtures``).
 """
 
 import json
@@ -15,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from rdkit import Chem
 
 from hyper_fingerprints.encoder import Encoder
 
@@ -67,16 +70,51 @@ def encoder(fixture_data):
     )
 
 
-# ── Codebook test ───────────────────────────────────────────────────────
+# ── Seed -> codebook / output stability ────────────────────────────────
 
 
-class TestCodebook:
-    """The generated codebook must exactly match the recorded fixture."""
+SEED_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "seed_fixtures.npz"
 
-    def test_codebook_matches(self, encoder, fixture_data):
-        codebook = _to_numpy(encoder._codebook)
-        expected = fixture_data["codebook"]
-        np.testing.assert_allclose(codebook, expected, atol=ATOL, rtol=0)
+
+@pytest.fixture(scope="module")
+def seed_fixture():
+    if not SEED_FIXTURE_PATH.exists():
+        pytest.skip("Seed fixtures not found. Run 'python -m tests.generate_fixtures'.")
+    raw = np.load(SEED_FIXTURE_PATH, allow_pickle=False)
+    return raw, json.loads(str(raw["config"]))
+
+
+class TestSeedFixtures:
+    """Codebooks generated from a seed, and composite-mode outputs, must match
+    the values recorded by ``generate_fixtures.py`` (no codebook injection)."""
+
+    def test_legacy_codebook_from_seed(self, seed_fixture):
+        raw, cfg = seed_fixture
+        enc = Encoder(dimension=cfg["dimension"], seed=cfg["seed"])
+        np.testing.assert_allclose(enc._codebook, raw["legacy_codebook"], atol=ATOL, rtol=0)
+
+    def test_composite_codebooks_from_seed(self, seed_fixture):
+        raw, cfg = seed_fixture
+        enc = Encoder(
+            dimension=cfg["dimension"], depth=cfg["depth"], seed=cfg["seed"], normalize=True,
+            features=cfg["features"], graph_features=cfg["graph_features"],
+        )
+        for name, arr in enc._node_encoder.arrays().items():
+            np.testing.assert_allclose(arr, raw[f"node/{name}"], atol=ATOL, rtol=0, err_msg=name)
+        for name, arr in enc._graph_encoder.arrays().items():
+            np.testing.assert_allclose(arr, raw[f"graph/{name}"], atol=ATOL, rtol=0, err_msg=name)
+
+    def test_composite_outputs(self, seed_fixture):
+        raw, cfg = seed_fixture
+        enc = Encoder(
+            dimension=cfg["dimension"], depth=cfg["depth"], seed=cfg["seed"], normalize=True,
+            features=cfg["features"], graph_features=cfg["graph_features"],
+        )
+        smiles = json.loads(str(raw["composite_smiles"]))
+        np.testing.assert_allclose(enc.encode(smiles), raw["composite_encode"], atol=ATOL, rtol=0)
+        np.testing.assert_allclose(
+            enc.encode_joint(smiles), raw["composite_encode_joint"], atol=ATOL, rtol=0
+        )
 
 
 # ── Individual molecule tests ───────────────────────────────────────────
@@ -126,19 +164,21 @@ class TestBatchEncode:
 
 class TestBatchConsistency:
     """Encoding molecules individually must produce the same vectors as
-    encoding them in a single batch call."""
+    encoding them in a single batch call.
 
-    @staticmethod
-    def _is_single_atom(smi: str) -> bool:
-        mol = Chem.MolFromSmiles(smi)
-        return mol is not None and mol.GetNumAtoms() == 1
+    Legacy mode is *not* batch-invariant for edgeless (single-atom) molecules
+    ("C" and "O" in the fixture); that behaviour is pinned explicitly in
+    ``test_encoder.py::TestBatchInvariance`` and excluded here.
+    """
+
+    SINGLE_ATOM = {"C", "O"}
 
     def test_encode_batch_vs_individual(self, encoder, fixture_data):
         smiles = fixture_data["smiles"]
         batch_result = _to_numpy(encoder.encode(smiles))
         for i, smi in enumerate(smiles):
-            if self._is_single_atom(smi):
-                continue  # single-atom molecules have a known batch discrepancy
+            if smi in self.SINGLE_ATOM:
+                continue
             individual = _to_numpy(encoder.encode(smi))
             np.testing.assert_allclose(
                 batch_result[i : i + 1], individual, atol=ATOL, rtol=0,
@@ -149,8 +189,8 @@ class TestBatchConsistency:
         smiles = fixture_data["smiles"]
         batch_result = _to_numpy(encoder.encode_joint(smiles))
         for i, smi in enumerate(smiles):
-            if self._is_single_atom(smi):
-                continue  # single-atom molecules have a known batch discrepancy
+            if smi in self.SINGLE_ATOM:
+                continue
             individual = _to_numpy(encoder.encode_joint(smi))
             np.testing.assert_allclose(
                 batch_result[i : i + 1], individual, atol=ATOL, rtol=0,

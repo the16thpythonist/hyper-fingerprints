@@ -26,21 +26,24 @@ def get_version() -> str:
 @dataclass
 class GraphData:
     """Minimal graph representation for a single molecule."""
-    x: np.ndarray          # [N, 5]
+    x: np.ndarray          # [N, F]
     edge_index: np.ndarray  # [2, E]
+    g: np.ndarray | None = None  # [G] graph-level feature values (composite mode)
 
 
 @dataclass
 class GraphBatch:
     """Batched graph representation for multiple molecules."""
-    x: np.ndarray          # [total_N, 5]
+    x: np.ndarray          # [total_N, F]
     edge_index: np.ndarray  # [2, total_E]
     batch: np.ndarray      # [total_N]
+    g: np.ndarray | None = None  # [B, G] graph-level feature values (composite mode)
 
 
 def batch_from_data_list(data_list: list[GraphData]) -> GraphBatch:
     """Concatenate a list of GraphData into a single GraphBatch."""
     xs = []
+    gs = []
     edge_indices = []
     batch_indices = []
     node_offset = 0
@@ -48,6 +51,8 @@ def batch_from_data_list(data_list: list[GraphData]) -> GraphBatch:
     for i, data in enumerate(data_list):
         num_nodes = data.x.shape[0]
         xs.append(data.x)
+        if data.g is not None:
+            gs.append(data.g)
 
         if data.edge_index.shape[1] > 0:
             edge_indices.append(data.edge_index + node_offset)
@@ -61,6 +66,7 @@ def batch_from_data_list(data_list: list[GraphData]) -> GraphBatch:
         x=np.concatenate(xs, axis=0) if xs else np.empty((0, 5), dtype=np.float64),
         edge_index=np.concatenate(edge_indices, axis=1) if edge_indices else np.empty((2, 0), dtype=np.int64),
         batch=np.concatenate(batch_indices) if batch_indices else np.empty(0, dtype=np.int64),
+        g=np.stack(gs, axis=0) if gs else None,
     )
 
 
@@ -93,6 +99,7 @@ def scatter_hd(
     *,
     op: str,
     dim_size: int | None = None,
+    empty: str = "identity",
 ) -> np.ndarray:
     """Scatter-reduce hypervectors along dim=0.
 
@@ -106,12 +113,18 @@ def scatter_hd(
         ``"bundle"`` (element-wise sum) or ``"bind"`` (element-wise product).
     dim_size : int, optional
         Number of output buckets.
+    empty : str
+        Result when ``index`` is empty: ``"identity"`` (HRR identity rows,
+        legacy behaviour) or ``"zeros"``. Buckets that receive no entries
+        when ``index`` is non-empty are always zero for ``"bundle"``.
     """
     d = src.shape[-1]
 
     if index.size == 0:
         if dim_size is None:
             dim_size = 1
+        if empty == "zeros":
+            return np.zeros((dim_size, d), dtype=np.float64)
         return hrr_identity(dim_size, d)
 
     if dim_size is None:

@@ -4,6 +4,54 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-09-11
+
+### Added
+
+- **Composite (per-feature) encoder** with FHRR continuous features, selected
+  by passing `features` as a `{name: cfg}` dict. Each feature gets its own
+  codebook (`"categorical"` lookup or `"continuous"` fractional-power encoding
+  with a `bandwidth`); the per-feature hypervectors are bound by circular
+  convolution. Ported from `graph_hdc`; the legacy list-based product-codebook
+  encoder and its outputs are unchanged.
+- Presets: `FEATURES_DEFAULT`, `FEATURES_CONTINUOUS`, `FEATURES_GRAPH_HDC`,
+  `GRAPH_FEATURES_GRAPH_HDC`.
+- Graph-level features (`graph_size`, `graph_diameter`, `graph_total_charge`)
+  via `graph_features=` with `graph_mode="bundle" | "bind" | "concat"`.
+- New `Encoder` options `bidirectional` (default `True`) and
+  `unknown_atoms="error" | "slot"`; new atom feature `implicit_hydrogens`.
+- `Encoder.from_legacy_codebook(path)` imports a codebook exported by
+  `graph_hdc.HyperNet.export_legacy_codebook`, reproducing graph_hdc
+  embeddings to ~1e-15 (node features) / ~1e-8 (graph features, float32
+  rounding on the graph_hdc side). Covered by `tests/test_legacy_parity.py`.
+- `save()` / `load()` handle composite encoders (format version 2); legacy
+  files still load.
+
+### Fixed
+
+- Rust backend: SMILES with Kekulé-form aromatic rings (`C1=CC=CC=C1`) were
+  featurized as non-aromatic, giving a different fingerprint than `c1ccccc1`
+  or the equivalent RDKit `Mol`. Such strings are now aromatized via RDKit
+  before reaching the Rust parser.
+- Legacy feature lists containing `implicit_hydrogens` failed for SMILES
+  input under `backend="auto"`; unsupported features now take the RDKit
+  preparation path.
+- `encode([])` returned a spurious `(1, D)` row on the NumPy backend; both
+  backends now return `(0, D)`.
+- Composite mode is batch-invariant for single-atom molecules (a node with no
+  incoming messages aggregates to zero, matching graph_hdc). Legacy mode keeps
+  its historical behaviour (`encode("C")` differs from `encode(["C", "CC"])[0]`),
+  now documented and pinned by a test.
+- `Encoder.load` raises instead of silently regenerating codebooks when a
+  composite file lacks an array for a declared feature.
+
+### Notes
+
+- The composite encoder currently runs on the NumPy backend only;
+  `backend="rust"` raises, `"auto"` falls back silently.
+- New `tests/fixtures/seed_fixtures.npz` protects seed→codebook generation for
+  both modes and composite-mode outputs; `regression_data.npz` is unchanged.
+
 ## [0.2.2] - 2026-04-01
 
 ### Added

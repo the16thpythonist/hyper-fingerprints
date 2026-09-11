@@ -5,18 +5,30 @@ Run this script once to record the current encoder outputs. The resulting
 .npz file is loaded by test_regression.py to verify that future refactors
 preserve identical results.
 
-The codebook is exported as a plain numpy array so that fixtures remain
-valid even after replacing torch/torchhd with a different backend.
+Two fixture files are written (paths relative to the repository root):
+
+- ``tests/fixtures/regression_data.npz`` -- legacy encoder outputs with the
+  codebook stored alongside and re-injected by the tests (protects the
+  message-passing pipeline). Regenerating this changes the codebook.
+- ``tests/fixtures/seed_fixtures.npz`` -- codebooks generated from a seed for
+  both encoder modes plus composite-mode outputs (protects seed -> codebook
+  RNG paths and composite-mode stability).
 
 Usage:
-    python -m tests.generate_fixtures
+    python -m tests.generate_fixtures            # both files
+    python -m tests.generate_fixtures seed       # seed_fixtures.npz only
 """
 
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 
 from hyper_fingerprints.encoder import Encoder
+from hyper_fingerprints.presets import FEATURES_GRAPH_HDC, GRAPH_FEATURES_GRAPH_HDC
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
 # ── Encoder configuration ──────────────────────────────────────────────
 SEED = 42
@@ -108,7 +120,7 @@ def main() -> None:
         save_dict[f"ind_encode_{i}"] = individual_encode[smi]
         save_dict[f"ind_joint_{i}"] = individual_encode_joint[smi]
 
-    out_path = "tests/fixtures/regression_data.npz"
+    out_path = FIXTURE_DIR / "regression_data.npz"
     np.savez(out_path, **save_dict)
     print(f"Saved regression fixtures to {out_path}")
     print(f"  {len(SMILES)} molecules")
@@ -117,5 +129,38 @@ def main() -> None:
     print(f"  encode_joint shape: {batch_encode_joint.shape}")
 
 
+def generate_seed_fixtures() -> None:
+    """Record seed-generated codebooks and composite-mode outputs."""
+    seed, dimension, depth = 7, 64, 2
+    composite_smiles = ["CCO", "c1ccccc1", "CC(=O)Nc1ccc(O)cc1", "C", "CC.O"]
+
+    legacy = Encoder(dimension=dimension, seed=seed)
+    composite = Encoder(
+        dimension=dimension, depth=depth, seed=seed, normalize=True,
+        features=FEATURES_GRAPH_HDC, graph_features=GRAPH_FEATURES_GRAPH_HDC,
+    )
+    config = {
+        "seed": seed, "dimension": dimension, "depth": depth,
+        "features": FEATURES_GRAPH_HDC, "graph_features": GRAPH_FEATURES_GRAPH_HDC,
+    }
+    save_dict = {
+        "config": np.array(json.dumps(config)),
+        "legacy_codebook": legacy._codebook,
+        "composite_smiles": np.array(json.dumps(composite_smiles)),
+        "composite_encode": composite.encode(composite_smiles),
+        "composite_encode_joint": composite.encode_joint(composite_smiles),
+    }
+    save_dict.update({f"node/{k}": v for k, v in composite._node_encoder.arrays().items()})
+    save_dict.update({f"graph/{k}": v for k, v in composite._graph_encoder.arrays().items()})
+
+    out_path = FIXTURE_DIR / "seed_fixtures.npz"
+    np.savez(out_path, **save_dict)
+    print(f"Saved seed fixtures to {out_path}")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "seed":
+        generate_seed_fixtures()
+    else:
+        main()
+        generate_seed_fixtures()
