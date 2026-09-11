@@ -59,6 +59,11 @@ def _needs_rdkit_canonicalization(smiles: str) -> bool:
         c = smiles[i]
         if c == "[":
             close = smiles.find("]", i)
+            # Explicit hydrogens ([H], [2H]) are removed by RDKit but kept by
+            # the Rust parser; let RDKit normalize them as well.
+            body = smiles[i + 1 : close].lstrip("0123456789")
+            if body[:1] == "H" and not body[1:2].islower():
+                return True
             i = n if close < 0 else close + 1
             continue
         if c == ":":
@@ -80,10 +85,52 @@ def _needs_rdkit_canonicalization(smiles: str) -> bool:
 
 
 def _canonical_smiles(smiles: str) -> str:
+    return Chem.MolToSmiles(_mol_from_smiles(smiles))
+
+
+def _mol_from_smiles(smiles: str) -> Chem.Mol:
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
+    if mol is None or mol.GetNumAtoms() == 0:
         raise ValueError(f"Invalid SMILES: {smiles!r}")
-    return Chem.MolToSmiles(mol)
+    return mol
+
+
+def _check_mol(mol: Chem.Mol) -> Chem.Mol:
+    if mol.GetNumAtoms() == 0:
+        raise ValueError("Molecule has no atoms")
+    if mol.NeedsUpdatePropertyCache():
+        raise ValueError("Molecule is not sanitized; pass a sanitized RDKit Mol")
+    return mol
+
+
+_FEATURE_CFG_KEYS = {"kind", "bandwidth", "size", "seed_offset", "clip"}
+
+
+def _validate_feature_cfg(name: str, cfg, *, allow_categorical: bool) -> None:
+    if not isinstance(cfg, dict):
+        raise ValueError(f"config for feature {name!r} must be a dict, got {type(cfg).__name__}")
+    unknown = set(cfg) - _FEATURE_CFG_KEYS
+    if unknown:
+        raise ValueError(
+            f"unknown keys {sorted(unknown)} in config for feature {name!r}; "
+            f"allowed: {sorted(_FEATURE_CFG_KEYS)}"
+        )
+    kind = cfg.get("kind", "categorical")
+    if kind == "continuous":
+        bw = cfg.get("bandwidth")
+        if not isinstance(bw, (int, float)) or isinstance(bw, bool) or not bw > 0:
+            raise ValueError(f"feature {name!r}: continuous features need a bandwidth > 0, got {bw!r}")
+    elif kind == "categorical":
+        if not allow_categorical:
+            raise ValueError(f"graph feature {name!r} must be 'continuous' with a bandwidth")
+        if "clip" in cfg and (not isinstance(cfg["clip"], int) or cfg["clip"] < 0):
+            raise ValueError(f"feature {name!r}: clip must be a non-negative int, got {cfg['clip']!r}")
+    else:
+        raise ValueError(
+            f"feature {name!r}: kind must be 'categorical' or 'continuous', got {kind!r}"
+        )
+    if "seed_offset" in cfg and not isinstance(cfg["seed_offset"], int):
+        raise ValueError(f"feature {name!r}: seed_offset must be an int")
 
 
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -189,26 +236,25 @@ class Encoder:
         self.bidirectional = bidirectional
         self.unknown_atoms = unknown_atoms
 
-        self.mode = "composite" if isinstance(self.features, dict) else "legacy"
+        if isinstance(self.features, dict):
+            self.mode = "composite"
+        elif isinstance(self.features, (list, tuple)):
+            self.features = list(self.features)
+            self.mode = "legacy"
+        else:
+            raise ValueError(
+                f"features must be a list of names or a dict of configs, "
+                f"got {type(self.features).__name__}"
+            )
+        if not self.graph_features:
+            self.graph_features = None
 
-        if graph_mode not in ("bundle", "bind", "concat"):
-            raise ValueError(
-                f"graph_mode must be 'bundle', 'bind' or 'concat', got {graph_mode!r}"
-            )
-        if unknown_atoms not in ("error", "slot"):
-            raise ValueError(
-                f"unknown_atoms must be 'error' or 'slot', got {unknown_atoms!r}"
-            )
-        if self.mode == "legacy" and (graph_features or unknown_atoms != "error"):
-            raise ValueError(
-                "graph_features and unknown_atoms='slot' require the composite "
-                "encoder (pass `features` as a dict)"
-            )
+        self._validate_config(codebook)
 
         self._atom_to_idx = atom_type_map(self.atom_types)
         self._feature_defs = resolve_features(self.features, self.atom_types)
         self._feature_bins = feature_bins(self.atom_types, self.features)
-        self._graph_feature_defs = resolve_graph_features(graph_features)
+        self._graph_feature_defs = resolve_graph_features(self.graph_features)
 
         if self.mode == "legacy":
             # Build product codebook
@@ -225,8 +271,6 @@ class Encoder:
             self._node_encoder = None
             self._graph_encoder = None
         else:
-            if codebook is not None:
-                raise ValueError("`codebook` is only valid for the legacy (list) feature mode")
             self._codebook = None
             node_cfgs = {}
             for fd, (name, cfg) in zip(self._feature_defs, self.features.items()):
@@ -242,14 +286,87 @@ class Encoder:
             )
             self._graph_encoder = None
             if self._graph_feature_defs:
-                for name, cfg in graph_features.items():
-                    if cfg.get("kind") != "continuous":
-                        raise ValueError(
-                            f"graph feature {name!r} must be 'continuous' with a bandwidth"
-                        )
                 self._graph_encoder = CompositeEncoder(
-                    dimension, dict(graph_features), seed=seed, codebooks=graph_codebooks
+                    dimension, dict(self.graph_features), seed=seed, codebooks=graph_codebooks
                 )
+
+    # ───────────────────── Validation ─────────────────────
+
+    def _validate_config(self, codebook) -> None:
+        """Reject invalid configurations here, so that ``encode`` never has to."""
+        def _is_int(x):
+            return isinstance(x, (int, np.integer)) and not isinstance(x, bool)
+
+        def _is_bool(x):
+            return isinstance(x, (bool, np.bool_))
+
+        if not _is_int(self.dimension) or self.dimension < 1:
+            raise ValueError(f"dimension must be a positive integer, got {self.dimension!r}")
+        if not _is_int(self.depth) or self.depth < 0:
+            raise ValueError(f"depth must be a non-negative integer, got {self.depth!r}")
+        if self.seed is not None and (not _is_int(self.seed) or self.seed < 0):
+            raise ValueError(f"seed must be None or a non-negative integer, got {self.seed!r}")
+        for name in ("normalize", "bidirectional"):
+            if not _is_bool(getattr(self, name)):
+                raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
+        if self.backend not in ("auto", "rust", "numpy"):
+            raise ValueError(
+                f"backend must be 'auto', 'rust' or 'numpy', got {self.backend!r}"
+            )
+        if self.backend == "rust" and not _HAS_RUST:
+            raise ValueError("backend='rust' requested but the Rust extension is not installed")
+        if self.graph_mode not in ("bundle", "bind", "concat"):
+            raise ValueError(
+                f"graph_mode must be 'bundle', 'bind' or 'concat', got {self.graph_mode!r}"
+            )
+        if self.unknown_atoms not in ("error", "slot"):
+            raise ValueError(
+                f"unknown_atoms must be 'error' or 'slot', got {self.unknown_atoms!r}"
+            )
+
+        # atom vocabulary
+        if not isinstance(self.atom_types, (list, tuple)) or len(self.atom_types) == 0:
+            raise ValueError("atom_types must be a non-empty list of element symbols")
+        if len(set(self.atom_types)) != len(self.atom_types):
+            raise ValueError(f"atom_types contains duplicates: {self.atom_types}")
+        table = Chem.GetPeriodicTable()
+        for sym in self.atom_types:
+            try:
+                table.GetAtomicNumber(sym)
+            except Exception:
+                raise ValueError(f"atom_types contains unknown element symbol {sym!r}") from None
+
+        # features
+        if len(self.features) == 0:
+            raise ValueError("features must contain at least one feature")
+        if self.mode == "legacy":
+            if len(set(self.features)) != len(self.features):
+                raise ValueError(f"features contains duplicates: {self.features}")
+            if codebook is not None:
+                expected = (math.prod(feature_bins(self.atom_types, self.features)), self.dimension)
+                shape = tuple(np.shape(codebook))
+                if shape != expected:
+                    raise ValueError(f"codebook has shape {shape}, expected {expected}")
+            if self.graph_features or self.unknown_atoms != "error":
+                raise ValueError(
+                    "graph_features and unknown_atoms='slot' require the composite "
+                    "encoder (pass `features` as a dict)"
+                )
+            return
+
+        if codebook is not None:
+            raise ValueError("`codebook` is only valid for the legacy (list) feature mode")
+        if self.backend == "rust":
+            raise ValueError(
+                "backend='rust' is not yet supported for the composite (dict features) "
+                "encoder; use backend='numpy' or 'auto'"
+            )
+        for name, cfg in self.features.items():
+            _validate_feature_cfg(name, cfg, allow_categorical=True)
+        if self.features.get("element", {}).get("kind") == "continuous":
+            raise ValueError("feature 'element' cannot be continuous (its value is a vocabulary index)")
+        for name, cfg in (self.graph_features or {}).items():
+            _validate_feature_cfg(name, cfg, allow_categorical=False)
 
     def __repr__(self) -> str:
         return (
@@ -303,13 +420,17 @@ class Encoder:
         np.savez(path, config=np.array(json.dumps(config)), **arrays)
 
     @classmethod
-    def load(cls, path: Union[str, os.PathLike]) -> Encoder:
+    def load(cls, path: Union[str, os.PathLike], *, backend: str = "auto") -> Encoder:
         """Load an encoder from an ``.npz`` file.
+
+        The backend is a runtime preference and is not stored in the file.
 
         Parameters
         ----------
         path
             Path to the ``.npz`` file previously created by :meth:`save`.
+        backend
+            Backend for the loaded encoder (``"auto"`` | ``"rust"`` | ``"numpy"``).
 
         Returns
         -------
@@ -327,8 +448,9 @@ class Encoder:
                 seed=config["seed"],
                 codebook=data["codebook"],
                 features=config.get("features"),
+                backend=backend,
             )
-        return cls._from_composite_npz(data, config)
+        return cls._from_composite_npz(data, config, backend=backend)
 
     @classmethod
     def _from_composite_npz(cls, data, config: dict, **overrides) -> Encoder:
@@ -480,11 +602,6 @@ class Encoder:
             }
 
         if self.mode == "composite":
-            if self.backend == "rust":
-                raise RuntimeError(
-                    "backend='rust' is not yet supported for the composite "
-                    "(dict features) encoder; use backend='numpy' or 'auto'"
-                )
             batch = self._prepare_batch_from_list(molecules)
             return self._encode_batch_numpy(batch)
 
@@ -526,12 +643,11 @@ class Encoder:
         )
         for mol_input in molecules:
             if isinstance(mol_input, str):
-                mol = Chem.MolFromSmiles(mol_input)
-                if mol is None:
-                    raise ValueError(f"Invalid SMILES: {mol_input!r}")
+                mol = _mol_from_smiles(mol_input)
                 data_list.append(mol_to_data(mol, self._atom_to_idx, self._feature_defs, **kwargs))
             elif isinstance(mol_input, Chem.Mol):
-                data_list.append(mol_to_data(mol_input, self._atom_to_idx, self._feature_defs, **kwargs))
+                mol = _check_mol(mol_input)
+                data_list.append(mol_to_data(mol, self._atom_to_idx, self._feature_defs, **kwargs))
             else:
                 raise TypeError(
                     f"Expected str or Chem.Mol, got {type(mol_input).__name__}"

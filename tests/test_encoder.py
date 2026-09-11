@@ -318,9 +318,8 @@ class TestCompositeMode:
             Encoder(features=FEATURES_CONTINUOUS, graph_features={"graph_size": {"kind": "categorical"}})
 
     def test_rust_backend_rejected(self):
-        enc = Encoder(dimension=64, seed=0, features=FEATURES_CONTINUOUS, backend="rust")
-        with pytest.raises(RuntimeError):
-            enc.encode("CCO")
+        with pytest.raises(ValueError, match="rust"):
+            Encoder(dimension=64, seed=0, features=FEATURES_CONTINUOUS, backend="rust")
         # 'auto' silently uses numpy
         Encoder(dimension=64, seed=0, features=FEATURES_CONTINUOUS, backend="auto").encode("CCO")
 

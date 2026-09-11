@@ -44,11 +44,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   now documented and pinned by a test.
 - `Encoder.load` raises instead of silently regenerating codebooks when a
   composite file lacks an array for a declared feature.
+- Invalid configurations now raise `ValueError` at construction with a message
+  naming the parameter (`dimension < 1`, `depth < 0`, negative/non-int `seed`,
+  non-bool flags, unknown `backend`, empty/duplicate/unknown `atom_types` or
+  `features`, `bandwidth <= 0` or missing, unknown feature-config keys,
+  continuous `element`, wrong-shaped `codebook`). Previously some surfaced
+  late (`depth=-1` → `OverflowError` at encode), silently (`backend="foo"`
+  meant NumPy, `bandwidth=0` produced NaNs) or as a Rust panic that killed
+  the process (wrong-shaped `codebook`).
+- Input handling is now identical across backends and modes: empty SMILES,
+  zero-atom `Mol`s and unsanitized `Mol`s raise `ValueError`; explicit
+  hydrogens (`[H]C([H])([H])[H]`) are normalized by RDKit before the Rust
+  parser so they match the implicit form.
+- `Encoder.load(path, backend=...)`: the backend is a runtime preference and
+  is not stored in the file.
 
 ### Notes
 
 - The composite encoder currently runs on the NumPy backend only;
   `backend="rust"` raises, `"auto"` falls back silently.
+- Known difference: the Rust SMILES parser does not validate valences, so a
+  chemically impossible SMILES like `C[C](C)(C)(C)(C)C` is accepted on the
+  Rust path but rejected by RDKit. Pinned in `tests/test_public_api.py`.
 - New `tests/fixtures/seed_fixtures.npz` protects seed→codebook generation for
   both modes and composite-mode outputs; `regression_data.npz` is unchanged.
 
