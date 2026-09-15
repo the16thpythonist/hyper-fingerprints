@@ -7,11 +7,19 @@ edition = "2021"
 name = "_core"
 crate-type = ["cdylib"]
 
+[features]
+# On by default so `maturin build` produces an extension module. Disable it
+# (`cargo test --no-default-features`) to build the Rust unit tests, which need
+# to link against libpython as a normal binary.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.28", features = ["abi3-py39", "extension-module"] }
+pyo3 = { version = "0.28", features = ["abi3-py39"] }
 numpy = "0.28"
 ndarray = "0.17"
 purr = "0.9"
 realfft = "3.5"
+rustfft = "6.4"
 num-complex = "0.4"
 rayon = "1.10"

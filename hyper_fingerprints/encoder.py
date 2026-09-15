@@ -33,7 +33,11 @@ from hyper_fingerprints.utils import (
 )
 
 try:
-    from hyper_fingerprints._core import encode_batch_rs, prepare_batch_rs
+    from hyper_fingerprints._core import (
+        encode_batch_hv_rs,
+        encode_batch_rs,
+        prepare_batch_rs,
+    )
     _HAS_RUST = True
 except ImportError:
     _HAS_RUST = False
@@ -194,7 +198,10 @@ class Encoder:
     backend : str
         Encoding backend: ``"auto"`` (use Rust if available, else NumPy),
         ``"rust"`` (require Rust extension), or ``"numpy"`` (force pure
-        NumPy). Default ``"auto"``.
+        NumPy). Default ``"auto"``. Both modes run their message passing in
+        Rust; composite mode additionally builds its node hypervectors in
+        NumPy and is always parsed by RDKit (the Rust SMILES parser handles
+        the legacy feature set only).
 
     Examples
     --------
@@ -356,11 +363,6 @@ class Encoder:
 
         if codebook is not None:
             raise ValueError("`codebook` is only valid for the legacy (list) feature mode")
-        if self.backend == "rust":
-            raise ValueError(
-                "backend='rust' is not yet supported for the composite (dict features) "
-                "encoder; use backend='numpy' or 'auto'"
-            )
         for name, cfg in self.features.items():
             _validate_feature_cfg(name, cfg, allow_categorical=True)
         if self.features.get("element", {}).get("kind") == "continuous":
@@ -602,8 +604,11 @@ class Encoder:
             }
 
         if self.mode == "composite":
+            # The Rust SMILES parser only emits legacy product-codebook indices,
+            # so composite input is always prepared with RDKit; the message
+            # passing can still run on either backend.
             batch = self._prepare_batch_from_list(molecules)
-            return self._encode_batch_numpy(batch)
+            return self._encode_batch(batch)
 
         use_rust = (self.backend == "rust") or (self.backend == "auto" and _HAS_RUST)
         # The Rust SMILES parser only knows the built-in feature set; other
@@ -682,9 +687,11 @@ class Encoder:
             "node_terms": np.asarray(node_terms),
         }
 
-    def _encode_node_features(self, x: np.ndarray) -> np.ndarray:
+    def _encode_node_features(self, x: np.ndarray, *, use_rust: bool = False) -> np.ndarray:
         """Map node feature matrix ``[N, F]`` to hypervectors ``[N, D]``."""
         if self.mode == "composite":
+            if use_rust:
+                return self._node_encoder.encode_rust(x)
             return self._node_encoder.encode(x)
         return self._encoder.encode(x)
 
@@ -708,21 +715,35 @@ class Encoder:
 
     def _encode_batch_rust(self, batch: GraphBatch) -> dict[str, np.ndarray]:
         """Rust-accelerated message-passing pipeline."""
-        feature_indices = self._encoder.encode_indices(batch.x)
         num_graphs = int(batch.batch.max()) + 1 if batch.batch.size > 0 else 1
 
-        graph_embedding, node_terms = encode_batch_rs(
-            self._codebook,
-            feature_indices,
-            batch.edge_index,
-            batch.batch,
-            num_graphs,
-            self.depth,
-            self.normalize,
-        )
+        if self.mode == "composite":
+            node_hv = self._encode_node_features(batch.x, use_rust=True)
+            graph_embedding, node_terms = encode_batch_hv_rs(
+                np.ascontiguousarray(node_hv, dtype=np.float64),
+                batch.edge_index,
+                batch.batch,
+                num_graphs,
+                self.depth,
+                "l2" if self.normalize else "none",
+                False,  # empty="zeros" scatter semantics
+            )
+        else:
+            feature_indices = self._encoder.encode_indices(batch.x)
+            graph_embedding, node_terms = encode_batch_rs(
+                self._codebook,
+                feature_indices,
+                batch.edge_index,
+                batch.batch,
+                num_graphs,
+                self.depth,
+                self.normalize,
+            )
+
+        graph_embedding = self._apply_graph_features(np.asarray(graph_embedding), batch)
 
         return {
-            "graph_embedding": np.asarray(graph_embedding),
+            "graph_embedding": graph_embedding,
             "node_terms": np.asarray(node_terms),
         }
 
@@ -769,22 +790,34 @@ class Encoder:
         # Order-N: bundle of all-layer node HVs per graph
         graph_embedding = scatter_hd(src=node_hv_bundled, index=batch.batch, op="bundle")
 
-        # Graph-level properties (composite mode only)
-        if self._graph_encoder is not None and batch.g is not None:
-            graph_hv = self._encode_graph_features(batch.g)
-            if self.graph_mode == "bundle":
-                graph_embedding = _l2_normalize(
-                    _l2_normalize(graph_embedding) + _l2_normalize(graph_hv)
-                )
-            elif self.graph_mode == "bind":
-                graph_embedding = hrr_bind(graph_embedding, graph_hv)
-            else:  # concat
-                graph_embedding = np.concatenate([graph_embedding, graph_hv], axis=-1)
+        graph_embedding = self._apply_graph_features(graph_embedding, batch)
 
         return {
             "graph_embedding": graph_embedding,
             "node_terms": node_terms,
         }
+
+    def _apply_graph_features(
+        self, graph_embedding: np.ndarray, batch: GraphBatch
+    ) -> np.ndarray:
+        """Fold graph-level property hypervectors into the readout.
+
+        Backend-independent: both the NumPy and Rust message-passing paths
+        call this on their ``[B, D]`` order-N embedding. No-op outside
+        composite mode, where ``graph_features`` is unavailable.
+        """
+        if self._graph_encoder is None or batch.g is None:
+            return graph_embedding
+
+        graph_hv = self._encode_graph_features(batch.g)
+        if self.graph_mode == "bundle":
+            return _l2_normalize(
+                _l2_normalize(graph_embedding) + _l2_normalize(graph_hv)
+            )
+        if self.graph_mode == "bind":
+            return hrr_bind(graph_embedding, graph_hv)
+        # concat
+        return np.concatenate([graph_embedding, graph_hv], axis=-1)
 
     def _encode_graph_features(self, g: np.ndarray) -> np.ndarray:
         """Sum of per-property FHRR hypervectors ``[B, D]`` (graph_hdc convention)."""

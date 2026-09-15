@@ -11,7 +11,9 @@ All planned phases are complete. The Rust extension provides a **~22x end-to-end
 | Component | Crate | What it does |
 |---|---|---|
 | `prepare_batch_rs` | `purr` | SMILES parsing + atom feature extraction + graph batching in one call |
-| `encode_batch_rs` | `realfft` + `rayon` | Message-passing + graph readout with molecule-level parallelism |
+| `encode_batch_rs` | `realfft` + `rayon` | Message-passing + graph readout with molecule-level parallelism (legacy product codebook) |
+| `encode_batch_hv_rs` | `realfft` + `rayon` | Same loop over pre-computed node hypervectors — the composite encoder's entry point |
+| `composite_encode_rs` | `rustfft` + `realfft` + `rayon` | Composite node encoding: per-feature codebook lookups and FHRR fractional powers, bound together |
 
 ### Performance (512 molecules, dim=256, depth=2)
 
@@ -20,6 +22,20 @@ All planned phases are complete. The Rust extension provides a **~22x end-to-end
 | Stages 1-4 (parse + features + batch) | 105 ms | 4.6 ms | ~23x |
 | Stage 5 (message-passing) | 464 ms | 21.5 ms | ~22x |
 | **Total** | **569 ms** | **26 ms** | **~22x** |
+
+### Composite mode performance (512 molecules, 9956 atoms, dim=256, depth=2)
+
+| Stage | NumPy | Rust | Speedup |
+|---|---|---|---|
+| RDKit preparation (not ported) | 98 ms | 98 ms | 1x |
+| Node encoding (`composite_encode_rs`) | 510 ms | 22.7 ms | ~22x |
+| Message passing (`encode_batch_hv_rs`) | 280 ms | 12 ms | ~24x |
+| **Total** | **845 ms** | **119 ms** | **~7x** |
+
+RDKit preparation is now ~82% of composite runtime. Note also that the atoms in a batch carry
+very few *distinct* feature rows (51 across those 9956 atoms), so deduplicating the node
+encoding by unique row is a bit-identical ~40x on that stage — a cheaper win than this port for
+anyone revisiting the profile.
 
 ### Key implementation decisions
 
@@ -31,12 +47,34 @@ All planned phases are complete. The Rust extension provides a **~22x end-to-end
 - **Row-level FFT parallelism** also added within `hrr_bind_rows` as a secondary parallelism layer using thread-local scratch buffers.
 - **`purr`** crate for SMILES parsing (replaces RDKit for the Rust path). Symbol capitalization fix needed for bracket aromatic atoms (`[nH]` → "N").
 - **Configurable features** via `features=["element", "degree", ...]` parameter, driving both Python and Rust extraction paths.
+- **Composite mode shares the message-passing kernel.** `encode_batch_inner` gathers rows from the product codebook and delegates to `encode_batch_from_hv`; the composite encoder calls that same function through `encode_batch_hv_rs` with node hypervectors NumPy has already built from the per-feature codebooks. The two semantic differences between the modes are passed as parameters rather than branched on internally:
+  - `norm_mode`: `"none"`, `"legacy"` (`x / (‖x‖ + 1e-8)`) or `"l2"` (`x / max(‖x‖, 1e-12)`, matching `torch.nn.functional.normalize` for graph_hdc parity).
+  - `empty_identity`: whether an edgeless *batch* aggregates to the HRR identity (legacy `scatter_hd(empty="identity")`) or to zeros (composite).
+- **The composite path stops at the parser.** `prepare_batch_rs` only emits flat product-codebook indices, so composite molecules are always prepared with RDKit. Composite gains the message-passing and node-encoding speedups, not the SMILES-parsing one.
+- **Sampling never happens in Rust.** `composite_encode_rs` receives the categorical tables (`[C_f, D]` f64) and continuous spectra (`[D]` complex128) that NumPy already drew, so seeded reproducibility is entirely a Python-side property. `numpy` 0.28 exposes `Complex64` as an `Element`, so the spectra cross the boundary as complex arrays directly.
+- **The continuous branch needs a *full complex* inverse FFT — `realfft`'s c2r is wrong there.** `generate_hermitian_spectrum` makes the DC bin (and, for even `dim`, the Nyquist bin) real, and roughly half the time negative. A negative real raised to a non-integer power leaves the real axis, so `spectrum ** e` is **not** Hermitian: at `dim=256, seed=42` the Hermitian residual is ~2.0 and `ifft(...).real` discards ~5e-3 of imaginary energy. A c2r transform assumes the symmetry and would return a materially different vector. Everything *after* that `.real` is genuinely real, so the binding FFTs and the final inverse do use the cheaper r2c/c2r pair. This is why `rustfft` is a direct dependency alongside `realfft`.
+- **`z ** e` is evaluated as `exp(e * ln z)`, and `ln(spectrum)` is hoisted** out of the per-atom loop (it does not depend on the atom, so this is bit-identical and halves the transcendental work). NumPy instead switches to repeated multiplication for real integer exponents with `|e| < 100`. Replicating that dispatch was measured and rejected as unnecessary: on the exponents that actually occur it is worth ~1 ULP (see the parity numbers below).
 
 ### Test coverage
 
-- 76 Python tests (41 original + 35 cross-backend/edge-case)
-- 9 Rust `#[cfg(test)]` unit tests
+- 555 Python tests, including a `TestCompositeCrossBackend` class covering every composite
+  configuration (both presets, `normalize`, all three `graph_mode`s, `bidirectional=False`,
+  `unknown_atoms="slot"`, edgeless/disconnected/large batches)
+- 15 Rust `#[cfg(test)]` unit tests
 - `nox -s build_test` builds a wheel and runs all tests in a clean venv
+
+Composite parity is asserted with `atol=1e-10, rtol=1e-11` rather than the legacy
+`rtol=0`: unnormalized composite embeddings reach magnitudes of ~1e6 at depth 3, where an
+absolute-only tolerance is meaningless. Observed worst-case relative deviation is ~6e-12.
+
+Node hypervectors are additionally compared **directly**, before message passing can smear a
+discrepancy (`TestCompositeNodeEncoding`): both presets x `dim` in {64, 127, 128, 255, 256, 257,
+512} x `seed` in {0, 1, 42, 7}. Both axes matter — odd dimensions have no Nyquist bin, and
+whether the DC/Nyquist bins come out negative is seed-dependent, which decides whether the
+non-Hermitian case fires at all. Worst observed deviation across those 56 configurations is
+**1.3e-15**. The pre-existing composite fixtures in `tests/test_regression.py`
+(`atol=1e-10, rtol=0`) and the graph_hdc reference in `tests/test_legacy_parity.py` both pass
+unchanged through the Rust path.
 
 ---
 
@@ -226,6 +264,12 @@ maturin develop --uv --release
 
 # Build wheel
 maturin build --release
+
+# Rust unit tests. `extension-module` is a default feature, so it must be
+# switched off for the test binary to link against libpython as a normal
+# executable; libpython must also be on the loader path.
+LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") \
+    cargo test --no-default-features
 ```
 
 To auto-rebuild when Rust source changes, add to `pyproject.toml`:

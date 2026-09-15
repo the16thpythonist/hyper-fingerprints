@@ -227,3 +227,39 @@ class CompositeEncoder:
         for col, cb in enumerate(self.codebooks.values()):
             spec *= np.fft.fft(cb.encode(values[:, col]), axis=-1)
         return np.fft.ifft(spec, axis=-1).real
+
+    def encode_rust(self, values: np.ndarray) -> np.ndarray:
+        """Rust-accelerated :meth:`encode`; identical result, same arithmetic.
+
+        The codebooks are sampled here and passed across; nothing is drawn on
+        the Rust side. Agreement with :meth:`encode` is ~1 ULP -- the only
+        deviation is that Rust always evaluates ``z ** e`` as
+        ``exp(e * ln z)``, whereas NumPy switches to repeated multiplication
+        for real integer exponents with ``|e| < 100``. See
+        ``tests/test_rust_backend.py::TestCompositeNodeEncoding``.
+        """
+        from hyper_fingerprints._core import composite_encode_rs
+
+        values = np.asarray(values, dtype=np.float64)
+        if values.ndim == 1:
+            values = values[:, np.newaxis]
+        if values.shape[0] == 0:
+            return np.zeros((0, self.dim), dtype=np.float64)
+
+        kinds, categorical, spectra, bandwidths = [], [], [], []
+        for cb in self.codebooks.values():
+            if cb.kind == "categorical":
+                kinds.append(0)
+                categorical.append(np.ascontiguousarray(cb.vectors, dtype=np.float64))
+            else:
+                kinds.append(1)
+                spectra.append(np.ascontiguousarray(cb.spectrum, dtype=np.complex128))
+                bandwidths.append(float(cb.bandwidth))
+
+        return composite_encode_rs(
+            np.ascontiguousarray(values),
+            kinds,
+            categorical,
+            spectra,
+            bandwidths,
+        )

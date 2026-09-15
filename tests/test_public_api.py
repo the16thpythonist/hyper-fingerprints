@@ -235,7 +235,6 @@ INVALID = [
     (dict(codebook=np.zeros((3, 3)), features=FEATURES_CONTINUOUS), "legacy"),
     (dict(unknown_atoms="slot"), "composite"),
     (dict(graph_features=GRAPH_FEATURES_GRAPH_HDC), "composite"),
-    (dict(features=FEATURES_CONTINUOUS, backend="rust"), "rust"),
     (dict(features={"element": {}, "degree": {"kind": "continuous"}}), "bandwidth"),
     (dict(features={"element": {}, "degree": {"kind": "continuous", "bandwidth": 0}}), "bandwidth"),
     (dict(features={"element": {}, "degree": {"kind": "continuous", "bandwidth": -1.0}}), "bandwidth"),

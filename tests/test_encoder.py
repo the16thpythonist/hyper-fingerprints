@@ -9,6 +9,7 @@ import pytest
 from rdkit import Chem
 
 from hyper_fingerprints import Encoder
+from hyper_fingerprints.encoder import _HAS_RUST
 
 
 # ─────────────────────── Creation ───────────────────────
@@ -317,11 +318,17 @@ class TestCompositeMode:
         with pytest.raises(ValueError):
             Encoder(features=FEATURES_CONTINUOUS, graph_features={"graph_size": {"kind": "categorical"}})
 
-    def test_rust_backend_rejected(self):
-        with pytest.raises(ValueError, match="rust"):
-            Encoder(dimension=64, seed=0, features=FEATURES_CONTINUOUS, backend="rust")
-        # 'auto' silently uses numpy
-        Encoder(dimension=64, seed=0, features=FEATURES_CONTINUOUS, backend="auto").encode("CCO")
+    def test_rust_backend_accepted(self):
+        """Composite mode runs its message passing on either backend.
+
+        Cross-backend numerical parity is covered in tests/test_rust_backend.py;
+        here we only check that the configuration is accepted and encodes.
+        """
+        kwargs = dict(dimension=64, seed=0, features=FEATURES_CONTINUOUS)
+        expected = Encoder(**kwargs, backend="numpy").encode("CCO")
+        for backend in ("auto", "rust") if _HAS_RUST else ("auto",):
+            out = Encoder(**kwargs, backend=backend).encode("CCO")
+            np.testing.assert_allclose(out, expected, atol=1e-10, rtol=1e-11)
 
     def test_save_load_round_trip(self, tmp_path: Path):
         # seed=None: the loader cannot regenerate anything, so equality proves

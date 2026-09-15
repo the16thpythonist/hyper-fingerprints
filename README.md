@@ -189,7 +189,11 @@ hyper_net.export_legacy_codebook("codebook.npz")
 enc = Encoder.from_legacy_codebook("codebook.npz")
 ```
 
-The composite encoder currently runs on the NumPy backend only.
+The composite encoder runs on the Rust backend too: both its node encoding (per-feature
+lookups and FHRR fractional powers) and its message passing are Rust-accelerated, ~7x
+end-to-end. All codebook sampling stays in NumPy, so seeded reproducibility is unchanged.
+Composite molecules are still parsed by RDKit — the Rust SMILES parser covers the legacy
+feature set only — which is now the dominant remaining cost.
 
 ## ⚠️ Limitations
 
@@ -197,8 +201,10 @@ The composite encoder currently runs on the NumPy backend only.
   double, and aromatic bonds are not distinguished in the current feature scheme.
 - **No stereochemistry** — chirality and cis/trans isomerism are not encoded.
 - **No GPU acceleration** — encoding is CPU-only (NumPy or optional Rust
-  extension). The Rust backend does not yet cover the composite / continuous
-  encoder.
+  extension).
+- **No Rust SMILES parsing for composite features** — the Rust parser extracts
+  the legacy feature set only, so composite (dict-features) input is parsed by
+  RDKit. Node encoding and message passing are Rust-accelerated in both modes.
 - **Legacy single-atom batching quirk** — in the default (list-features)
   mode, a single-atom molecule such as `C` or `O` encodes differently alone
   than in a batch with bonded molecules. Kept for output stability; the

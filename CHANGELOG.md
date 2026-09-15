@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- The composite (dict-features) encoder now runs its message passing on the
+  Rust backend. `backend="rust"` is accepted for every composite
+  configuration — all feature kinds, `normalize`, `bidirectional`,
+  `unknown_atoms="slot"` and all three `graph_mode`s — and `backend="auto"`
+  uses Rust when the extension is available. There is no fallback path.
+- New `_core.encode_batch_hv_rs`: the message-passing loop over pre-computed
+  node hypervectors. `encode_batch_rs` now gathers its codebook rows and
+  delegates to the same kernel, so legacy output is unchanged. The two
+  semantics that differ between the modes are parameters: `norm_mode`
+  (`"legacy"` = `x / (|x| + 1e-8)` vs `"l2"` = `x / max(|x|, 1e-12)`) and
+  `empty_identity` (edgeless-batch scatter to the HRR identity vs to zeros).
+- `tests/test_rust_backend.py::TestCompositeCrossBackend`: cross-backend parity
+  across the composite configuration matrix, asserted at
+  `atol=1e-10, rtol=1e-11` (unnormalized composite embeddings reach ~1e6 at
+  depth 3, so an absolute-only tolerance is not meaningful there; observed
+  worst-case relative deviation is ~6e-12).
+
+- The composite node encoding (`CompositeEncoder.encode`) now also runs in Rust
+  via `_core.composite_encode_rs`: per-feature categorical lookups and FHRR
+  fractional powers, bound with one spectral product. All codebook sampling
+  stays in NumPy — the sampled tables and spectra are passed across the
+  boundary — so seeded reproducibility is unaffected.
+- `tests/test_rust_backend.py::TestCompositeNodeEncoding`: compares node
+  hypervectors directly (before message passing can smear a discrepancy)
+  across both presets x 7 dimensions x 4 seeds, plus bandwidth sweeps,
+  all-categorical and single-feature configurations, `unknown_atoms="slot"`,
+  and out-of-range index handling.
+
+### Changed
+
+- `Cargo.toml`: `extension-module` is now an optional feature, on by default.
+  `cargo test` could not link before this — the Rust unit tests now run with
+  `cargo test --no-default-features` (with libpython on `LD_LIBRARY_PATH`).
+
+### Notes
+
+- Composite molecules are still prepared with RDKit: `prepare_batch_rs` only
+  emits flat product-codebook indices, so the Rust SMILES parser covers the
+  legacy feature set only.
+- Measured on 512 PubChem molecules (9956 atoms, dim=256, depth=2): message
+  passing ~280 ms -> ~12 ms (~24x), node encoding ~510 ms -> ~23 ms (~22x),
+  end-to-end composite encoding 845 ms -> 119 ms (~7x). RDKit preparation
+  (~98 ms, not ported) is now ~82% of what remains.
+- Rust evaluates `z ** e` as `exp(e * ln z)` throughout, while NumPy switches
+  to repeated multiplication for real integer exponents with `|e| < 100`.
+  Replicating that dispatch was measured and rejected as unnecessary: worst
+  observed node-hypervector deviation across 56 configurations is 1.3e-15.
+  The composite fixtures in `tests/test_regression.py` (`atol=1e-10, rtol=0`)
+  and the graph_hdc reference in `tests/test_legacy_parity.py` pass unchanged
+  through the Rust path.
+- The continuous branch requires a *full complex* inverse FFT (`rustfft`, now a
+  direct dependency), not `realfft`'s c2r: the spectrum's DC bin — and, for
+  even `dim`, its Nyquist bin — is real and often negative, and raising a
+  negative real to a non-integer power breaks the Hermitian symmetry that c2r
+  assumes.
+- Atoms carry very few *distinct* feature rows (51 across 9956 atoms), so
+  deduplicating the node encoding by unique row is a bit-identical ~40x on
+  that stage. Not done here, but worth knowing before further optimization.
+
 ## [0.3.1] - 2026-09-11
 
 ### Fixed

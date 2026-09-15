@@ -11,6 +11,7 @@ use purr::graph::{Atom, Builder};
 use purr::read::read;
 use rayon::prelude::*;
 use realfft::{RealFftPlanner, RealToComplex, ComplexToReal};
+use rustfft::{Fft, FftPlanner};
 
 // ---------------------------------------------------------------------------
 // HRR bind (circular convolution via real FFT)
@@ -176,19 +177,61 @@ fn scatter_bind_op(src: &Array2<f64>, index: &Array1<i64>, dim_size: usize) -> A
 // Full encode_batch pipeline
 // ---------------------------------------------------------------------------
 
+/// Per-layer normalization variant.
+///
+/// The two encoder modes disagree on the formula: the legacy (product
+/// codebook) pipeline divides by `‖x‖ + 1e-8`, while the composite pipeline
+/// mirrors `torch.nn.functional.normalize` and divides by `max(‖x‖, 1e-12)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NormMode {
+    /// No normalization between layers.
+    None,
+    /// Legacy formula: `x / (‖x‖ + 1e-8)`.
+    LegacyEps,
+    /// Composite formula: `x / max(‖x‖, 1e-12)`.
+    L2Clamp,
+}
+
+impl NormMode {
+    fn from_str(name: &str) -> PyResult<Self> {
+        match name {
+            "none" => Ok(NormMode::None),
+            "legacy" => Ok(NormMode::LegacyEps),
+            "l2" => Ok(NormMode::L2Clamp),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "norm_mode must be 'none', 'legacy' or 'l2', got {other:?}"
+            ))),
+        }
+    }
+
+    /// Reciprocal scale factor applied to a row with squared norm `sq_norm`.
+    fn inv_scale(self, sq_norm: f64) -> f64 {
+        match self {
+            NormMode::None => 1.0,
+            NormMode::LegacyEps => 1.0 / (sq_norm.sqrt() + 1e-8),
+            NormMode::L2Clamp => 1.0 / sq_norm.sqrt().max(1e-12),
+        }
+    }
+}
+
 /// Encode a single molecule's message-passing pipeline.
 ///
 /// `batch_has_edges`: whether the parent batch contains any edges at all.
-/// This controls no-edge molecule behavior to match Python's batched scatter_hd:
+/// Together with `empty_identity` this controls no-edge molecule behavior so
+/// that it matches Python's batched `scatter_hd`:
 /// - batch has edges → no-edge molecules get zeros aggregation → bind(x,0)=0
-/// - batch has NO edges → identity aggregation → bind(x,id)=x
+/// - batch has NO edges and `empty_identity` (legacy, `empty="identity"`)
+///   → identity aggregation → bind(x,id)=x
+/// - batch has NO edges and not `empty_identity` (composite, `empty="zeros"`)
+///   → zeros aggregation → bind(x,0)=0
 fn encode_single_molecule(
     node_hv: &Array2<f64>,
     local_srcs: &[usize],
     local_dsts: &[usize],
     depth: usize,
-    normalize: bool,
+    norm_mode: NormMode,
     batch_has_edges: bool,
+    empty_identity: bool,
 ) -> (Array1<f64>, Array1<f64>) {
     let n = node_hv.nrows();
     let d = node_hv.ncols();
@@ -212,14 +255,14 @@ fn encode_single_molecule(
 
             let hr = hrr_bind_rows(&current_layer, &aggregated);
 
-            if normalize {
+            if norm_mode != NormMode::None {
                 current_layer = Array2::zeros((n, d));
                 for i in 0..n {
-                    let mut norm = 0.0f64;
+                    let mut sq_norm = 0.0f64;
                     for j in 0..d {
-                        norm += hr[[i, j]] * hr[[i, j]];
+                        sq_norm += hr[[i, j]] * hr[[i, j]];
                     }
-                    let inv_norm = 1.0 / (norm.sqrt() + 1e-8);
+                    let inv_norm = norm_mode.inv_scale(sq_norm);
                     for j in 0..d {
                         current_layer[[i, j]] = hr[[i, j]] * inv_norm;
                     }
@@ -230,15 +273,17 @@ fn encode_single_molecule(
 
             multibundle_sum += &current_layer;
         }
-    } else if depth > 0 && !batch_has_edges {
-        // No edges in entire batch: Python scatter_hd returns identity.
-        // bind(x, identity) = x → all layers equal layer 0.
-        // multibundle = (depth+1) * node_hv.
+    } else if depth > 0 && !batch_has_edges && empty_identity {
+        // No edges in entire batch: Python scatter_hd(empty="identity")
+        // returns identity. bind(x, identity) = x → all layers equal layer 0.
+        // multibundle = (depth+1) * node_hv. Composite mode always scatters
+        // with empty="zeros", so it passes empty_identity=false and takes the
+        // zero-aggregation branch below instead.
         for _ in 0..depth {
             multibundle_sum += &current_layer;
         }
     }
-    // else: depth > 0 && batch_has_edges && no local edges
+    // else: no local edges (and either the batch has edges, or empty="zeros")
     // Python scatter starts from zeros, this node gets aggregated=0.
     // bind(x, 0) = 0, so layers 1..depth are zeros.
     // multibundle = node_hv + 0 + ... = node_hv (already the state).
@@ -260,11 +305,10 @@ fn encode_batch_inner(
     batch_indices: &Array1<i64>,
     num_graphs: usize,
     depth: usize,
-    normalize: bool,
+    norm_mode: NormMode,
 ) -> (Array2<f64>, Array2<f64>) {
     let n = feature_indices.len();
     let d = codebook.ncols();
-    let batch_has_edges = edge_index.ncols() > 0;
 
     // Step 1: Gather node hypervectors from codebook
     let mut node_hv = Array2::zeros((n, d));
@@ -272,6 +316,38 @@ fn encode_batch_inner(
         let idx = feature_indices[i] as usize;
         node_hv.row_mut(i).assign(&codebook.row(idx));
     }
+
+    encode_batch_from_hv(
+        &node_hv,
+        edge_index,
+        batch_indices,
+        num_graphs,
+        depth,
+        norm_mode,
+        /* empty_identity = */ true,
+    )
+}
+
+/// Message passing over pre-computed node hypervectors.
+///
+/// This is the shared core: the legacy pipeline reaches it through
+/// `encode_batch_inner` (which gathers rows from a product codebook first),
+/// while the composite pipeline hands in node hypervectors that Python already
+/// built from per-feature codebooks.
+///
+/// Parallelizes across molecules in the batch using rayon.
+fn encode_batch_from_hv(
+    node_hv: &Array2<f64>,
+    edge_index: &Array2<i64>,
+    batch_indices: &Array1<i64>,
+    num_graphs: usize,
+    depth: usize,
+    norm_mode: NormMode,
+    empty_identity: bool,
+) -> (Array2<f64>, Array2<f64>) {
+    let n = node_hv.nrows();
+    let d = node_hv.ncols();
+    let batch_has_edges = edge_index.ncols() > 0;
 
     // Step 2: Partition nodes and edges by molecule
     let mut mol_node_start = vec![0usize; num_graphs + 1];
@@ -305,7 +381,7 @@ fn encode_batch_inner(
             let (ref local_srcs, ref local_dsts) = mol_edges[g];
             encode_single_molecule(
                 &mol_nodes, local_srcs, local_dsts,
-                depth, normalize, batch_has_edges,
+                depth, norm_mode, batch_has_edges, empty_identity,
             )
         })
         .collect();
@@ -349,6 +425,7 @@ fn encode_batch_rs<'py>(
     let feature_indices = feature_indices.to_owned_array();
     let edge_index = edge_index.to_owned_array();
     let batch_indices = batch_indices.to_owned_array();
+    let norm_mode = if normalize { NormMode::LegacyEps } else { NormMode::None };
 
     let (graph_emb, node_terms) = py.detach(|| {
         encode_batch_inner(
@@ -358,11 +435,367 @@ fn encode_batch_rs<'py>(
             &batch_indices,
             num_graphs,
             depth,
-            normalize,
+            norm_mode,
         )
     });
 
     (graph_emb.into_pyarray(py), node_terms.into_pyarray(py))
+}
+
+/// HRR message passing over pre-computed node hypervectors.
+///
+/// Used by the composite encoder, whose node hypervectors are built in Python
+/// from per-feature codebooks (categorical lookups bound with FHRR continuous
+/// encodings) and cannot be expressed as rows of a single product codebook.
+///
+/// Args:
+///     node_hv: [N, D] node hypervectors
+///     edge_index: [2, E]
+///     batch_indices: [N] graph membership
+///     num_graphs: number of graphs in the batch
+///     depth: number of message-passing layers
+///     norm_mode: "none", "legacy" (x / (‖x‖ + 1e-8)) or "l2" (x / max(‖x‖, 1e-12))
+///     empty_identity: for an edgeless batch, whether aggregation yields the
+///         HRR identity (legacy) or zeros (composite)
+///
+/// Returns:
+///     (graph_embedding [B, D], node_terms [B, D])
+#[pyfunction]
+fn encode_batch_hv_rs<'py>(
+    py: Python<'py>,
+    node_hv: PyReadonlyArray2<'py, f64>,
+    edge_index: PyReadonlyArray2<'py, i64>,
+    batch_indices: PyReadonlyArray1<'py, i64>,
+    num_graphs: usize,
+    depth: usize,
+    norm_mode: &str,
+    empty_identity: bool,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+    let norm_mode = NormMode::from_str(norm_mode)?;
+    let node_hv = node_hv.to_owned_array();
+    let edge_index = edge_index.to_owned_array();
+    let batch_indices = batch_indices.to_owned_array();
+
+    if batch_indices.len() != node_hv.nrows() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "batch_indices has length {} but node_hv has {} rows",
+            batch_indices.len(),
+            node_hv.nrows()
+        )));
+    }
+
+    let (graph_emb, node_terms) = py.detach(|| {
+        encode_batch_from_hv(
+            &node_hv,
+            &edge_index,
+            &batch_indices,
+            num_graphs,
+            depth,
+            norm_mode,
+            empty_identity,
+        )
+    });
+
+    Ok((graph_emb.into_pyarray(py), node_terms.into_pyarray(py)))
+}
+
+// ---------------------------------------------------------------------------
+// Composite node encoding (per-feature codebooks + FHRR continuous features)
+// ---------------------------------------------------------------------------
+
+/// One feature's codebook, as sampled by NumPy.
+///
+/// All randomness stays on the Python side: this only ever holds arrays that
+/// were handed across the FFI boundary.
+enum FeatureCodebook {
+    /// `[num_categories, D]` lookup table; the feature value is a row index.
+    Categorical(Array2<f64>),
+    /// FHRR fractional-power encoder. `ln_spectrum` is `ln(spectrum)`
+    /// precomputed once — it does not depend on the atom, and hoisting it out
+    /// of the per-atom loop is bit-identical while halving the transcendental
+    /// work (`z^e` is otherwise `exp(e * ln z)` with `ln z` recomputed every
+    /// time).
+    Continuous {
+        ln_spectrum: Array1<Complex64>,
+        bandwidth: f64,
+    },
+}
+
+/// Per-thread scratch for composite node encoding.
+struct CompositeScratch {
+    /// Full-length complex buffer for the continuous branch's inverse FFT.
+    full: Vec<Complex64>,
+    /// Scratch required by the rustfft plan.
+    fft_scratch: Vec<Complex64>,
+    /// Real-valued per-feature hypervector.
+    real: Vec<f64>,
+    /// Half-spectrum of the current feature.
+    spec: Vec<Complex64>,
+    /// Running product of half-spectra across features.
+    acc: Vec<Complex64>,
+    /// Scratch required by the realfft forward plan.
+    r2c_scratch: Vec<Complex64>,
+    /// Scratch required by the realfft inverse plan.
+    c2r_scratch: Vec<Complex64>,
+}
+
+impl CompositeScratch {
+    fn new(
+        cfft: &Arc<dyn Fft<f64>>,
+        r2c: &Arc<dyn RealToComplex<f64>>,
+        c2r: &Arc<dyn ComplexToReal<f64>>,
+        d: usize,
+    ) -> Self {
+        let complex_len = d / 2 + 1;
+        Self {
+            full: vec![Complex64::new(0.0, 0.0); d],
+            fft_scratch: vec![Complex64::new(0.0, 0.0); cfft.get_inplace_scratch_len()],
+            real: vec![0.0; d],
+            spec: vec![Complex64::new(0.0, 0.0); complex_len],
+            acc: vec![Complex64::new(0.0, 0.0); complex_len],
+            r2c_scratch: r2c.make_scratch_vec(),
+            c2r_scratch: c2r.make_scratch_vec(),
+        }
+    }
+}
+
+/// Encode a feature matrix `[N, F]` into node hypervectors `[N, D]`.
+///
+/// Mirrors `CompositeEncoder.encode` in `hyper_fingerprints/codebook.py`
+/// operation for operation:
+///
+/// 1. per feature, build a real hypervector
+///    - categorical: a codebook row
+///    - continuous: `ifft(spectrum ** (value / bandwidth)).real`
+/// 2. multiply the per-feature spectra together (circular convolution)
+/// 3. one inverse transform back to the real domain
+///
+/// Two numerical points make the transform choice non-obvious:
+///
+/// - The **continuous branch needs a full complex inverse FFT**. The spectrum
+///   is Hermitian-symmetric by construction, but its DC bin (and, for even
+///   `d`, its Nyquist bin) is real and frequently *negative*; a negative real
+///   raised to a non-integer power leaves the real axis, which breaks the
+///   Hermitian symmetry. NumPy discards the resulting imaginary component via
+///   `.real`, and a `c2r` transform — which assumes symmetry — would produce a
+///   materially different vector, not merely a rounding difference.
+/// - Everything *after* that `.real` is genuinely real, so its forward
+///   transform is Hermitian and the remaining steps use the cheaper r2c / c2r
+///   pair.
+fn composite_encode_inner(
+    values: &Array2<f64>,
+    codebooks: &[FeatureCodebook],
+) -> Array2<f64> {
+    let n = values.nrows();
+    let d = match codebooks.first() {
+        Some(FeatureCodebook::Categorical(table)) => table.ncols(),
+        Some(FeatureCodebook::Continuous { ln_spectrum, .. }) => ln_spectrum.len(),
+        None => 0,
+    };
+
+    if n == 0 || d == 0 {
+        return Array2::zeros((n, d));
+    }
+
+    let mut planner = RealFftPlanner::<f64>::new();
+    let r2c = planner.plan_fft_forward(d);
+    let c2r = planner.plan_fft_inverse(d);
+    let cfft = FftPlanner::<f64>::new().plan_fft_inverse(d);
+
+    let complex_len = d / 2 + 1;
+    let inv_d = 1.0 / d as f64;
+
+    let cfft_ref = Arc::clone(&cfft);
+    let r2c_ref = Arc::clone(&r2c);
+    let c2r_ref = Arc::clone(&c2r);
+    thread_local! {
+        static SCRATCH: RefCell<Option<(usize, CompositeScratch)>> = const { RefCell::new(None) };
+    }
+
+    let rows: Vec<Vec<f64>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            SCRATCH.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if borrow.as_ref().map_or(true, |(sz, _)| *sz != d) {
+                    *borrow = Some((
+                        d,
+                        CompositeScratch::new(&cfft_ref, &r2c_ref, &c2r_ref, d),
+                    ));
+                }
+                let s = &mut borrow.as_mut().unwrap().1;
+
+                s.acc.fill(Complex64::new(1.0, 0.0));
+
+                for (f, cb) in codebooks.iter().enumerate() {
+                    let value = values[[i, f]];
+
+                    match cb {
+                        FeatureCodebook::Categorical(table) => {
+                            let idx = value as usize;
+                            let row = table.row(idx);
+                            s.real
+                                .iter_mut()
+                                .zip(row.iter())
+                                .for_each(|(dst, src)| *dst = *src);
+                        }
+                        FeatureCodebook::Continuous {
+                            ln_spectrum,
+                            bandwidth,
+                        } => {
+                            // spectrum ** e == exp(e * ln spectrum)
+                            let e = value / bandwidth;
+                            for k in 0..d {
+                                s.full[k] = (ln_spectrum[k] * e).exp();
+                            }
+                            // Full complex inverse FFT; rustfft is unnormalized.
+                            cfft_ref.process_with_scratch(&mut s.full, &mut s.fft_scratch);
+                            for k in 0..d {
+                                s.real[k] = s.full[k].re * inv_d;
+                            }
+                        }
+                    }
+
+                    r2c_ref
+                        .process_with_scratch(&mut s.real, &mut s.spec, &mut s.r2c_scratch)
+                        .expect("r2c failed");
+                    for k in 0..complex_len {
+                        s.acc[k] *= s.spec[k];
+                    }
+                }
+
+                c2r_ref
+                    .process_with_scratch(&mut s.acc, &mut s.real, &mut s.c2r_scratch)
+                    .expect("c2r failed");
+                s.real.iter().map(|v| v * inv_d).collect::<Vec<f64>>()
+            })
+        })
+        .collect();
+
+    let flat: Vec<f64> = rows.into_iter().flatten().collect();
+    Array2::from_shape_vec((n, d), flat).unwrap()
+}
+
+/// Composite node encoding: feature values `[N, F]` -> hypervectors `[N, D]`.
+///
+/// Codebooks are sampled in NumPy and passed in; nothing is drawn here.
+///
+/// Args:
+///     values: [N, F] raw feature values (categorical ones are row indices)
+///     kinds: per feature, 0 = categorical, 1 = continuous
+///     categorical: [C_f, D] tables, in the order the categorical features appear
+///     spectra: [D] complex spectra, in the order the continuous features appear
+///     bandwidths: one per continuous feature, same order as `spectra`
+///
+/// Returns:
+///     node hypervectors [N, D]
+#[pyfunction]
+fn composite_encode_rs<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    kinds: Vec<u8>,
+    categorical: Vec<PyReadonlyArray2<'py, f64>>,
+    spectra: Vec<PyReadonlyArray1<'py, Complex64>>,
+    bandwidths: Vec<f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let values = values.to_owned_array();
+
+    if values.ncols() != kinds.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "values has {} columns but {} feature kinds were given",
+            values.ncols(),
+            kinds.len()
+        )));
+    }
+    if spectra.len() != bandwidths.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{} spectra but {} bandwidths",
+            spectra.len(),
+            bandwidths.len()
+        )));
+    }
+
+    // Consume the categorical tables and continuous spectra in feature order.
+    let mut cat_iter = categorical.into_iter();
+    let mut cont_iter = spectra.into_iter().zip(bandwidths);
+    let mut codebooks: Vec<FeatureCodebook> = Vec::with_capacity(kinds.len());
+    let mut dim: Option<usize> = None;
+
+    for (f, kind) in kinds.iter().enumerate() {
+        match kind {
+            0 => {
+                let table = cat_iter.next().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "feature {f} is categorical but no codebook was given for it"
+                    ))
+                })?;
+                let table = table.to_owned_array();
+                if table.nrows() == 0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "feature {f}: categorical codebook has no rows"
+                    )));
+                }
+                codebooks.push(FeatureCodebook::Categorical(table));
+            }
+            1 => {
+                let (spectrum, bandwidth) = cont_iter.next().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "feature {f} is continuous but no spectrum was given for it"
+                    ))
+                })?;
+                if bandwidth == 0.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "feature {f}: bandwidth must be non-zero"
+                    )));
+                }
+                let ln_spectrum = spectrum.to_owned_array().mapv(|z| z.ln());
+                codebooks.push(FeatureCodebook::Continuous {
+                    ln_spectrum,
+                    bandwidth,
+                });
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "feature {f}: kind must be 0 (categorical) or 1 (continuous), got {other}"
+                )))
+            }
+        }
+
+        let d = match codebooks.last().unwrap() {
+            FeatureCodebook::Categorical(t) => t.ncols(),
+            FeatureCodebook::Continuous { ln_spectrum, .. } => ln_spectrum.len(),
+        };
+        match dim {
+            None => dim = Some(d),
+            Some(expected) if expected != d => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "feature {f} has dimension {d}, expected {expected}"
+                )))
+            }
+            _ => {}
+        }
+    }
+
+    // Bounds-check categorical indices here, where a clear Python exception can
+    // still be raised (the kernel itself runs without the GIL).
+    for (f, cb) in codebooks.iter().enumerate() {
+        if let FeatureCodebook::Categorical(table) = cb {
+            let rows = table.nrows() as f64;
+            for i in 0..values.nrows() {
+                let v = values[[i, f]];
+                if !(v >= 0.0 && v < rows) || v.fract() != 0.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "feature {f}: categorical value {v} at row {i} is not a valid index \
+                         into a codebook with {} rows",
+                        table.nrows()
+                    )));
+                }
+            }
+        }
+    }
+
+    let out = py.detach(|| composite_encode_inner(&values, &codebooks));
+    Ok(out.into_pyarray(py))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +991,8 @@ fn prepare_batch_rs<'py>(
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_batch_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_batch_hv_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(composite_encode_rs, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_batch_rs, m)?)?;
     Ok(())
 }
@@ -700,5 +1135,214 @@ mod tests {
         assert!((result[[0, 0]] - 1.0).abs() < 1e-12);
         assert!((result[[2, 0]] - 1.0).abs() < 1e-12);
         assert!((result[[0, 1]] - 0.0).abs() < 1e-12);
+    }
+
+    // ---- encode_batch_from_hv / NormMode ----
+
+    /// Helper: two-node, two-molecule edgeless batch of unit-ish hypervectors.
+    fn edgeless_batch() -> (Array2<f64>, Array2<i64>, Array1<i64>) {
+        let node_hv = array![[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 0.25]];
+        let edge_index = Array2::<i64>::zeros((2, 0));
+        let batch = Array1::from_vec(vec![0_i64, 1]);
+        (node_hv, edge_index, batch)
+    }
+
+    /// empty_identity = false (composite): layers 1..depth aggregate to zero,
+    /// so the multibundle is just the layer-0 hypervector.
+    #[test]
+    fn test_from_hv_edgeless_zeros() {
+        let (node_hv, edge_index, batch) = edgeless_batch();
+        let (graph_emb, node_terms) =
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, false);
+        for g in 0..2 {
+            for j in 0..4 {
+                assert!((graph_emb[[g, j]] - node_hv[[g, j]]).abs() < 1e-12);
+                assert!((node_terms[[g, j]] - node_hv[[g, j]]).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// empty_identity = true (legacy): an edgeless batch aggregates to the HRR
+    /// identity, so every layer equals layer 0 and the multibundle scales by
+    /// depth + 1.
+    #[test]
+    fn test_from_hv_edgeless_identity() {
+        let (node_hv, edge_index, batch) = edgeless_batch();
+        let (graph_emb, _) =
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, true);
+        for g in 0..2 {
+            for j in 0..4 {
+                assert!((graph_emb[[g, j]] - 4.0 * node_hv[[g, j]]).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// Gathering from a codebook and passing the gathered rows directly must
+    /// give identical results.
+    #[test]
+    fn test_from_hv_matches_codebook_gather() {
+        let codebook = array![[0.1, 0.2, 0.3, 0.4], [-0.5, 0.6, 0.7, -0.8]];
+        let feature_indices = Array1::from_vec(vec![0_i64, 1, 1]);
+        let edge_index = array![[0_i64, 1, 1, 2], [1, 0, 2, 1]];
+        let batch = Array1::from_vec(vec![0_i64, 0, 0]);
+
+        let (via_codebook, nt_a) =
+            encode_batch_inner(&codebook, &feature_indices, &edge_index, &batch, 1, 2, NormMode::LegacyEps);
+
+        let mut node_hv = Array2::zeros((3, 4));
+        for i in 0..3 {
+            node_hv.row_mut(i).assign(&codebook.row(feature_indices[i] as usize));
+        }
+        let (via_hv, nt_b) =
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 2, NormMode::LegacyEps, true);
+
+        for j in 0..4 {
+            assert_eq!(via_codebook[[0, j]], via_hv[[0, j]]);
+            assert_eq!(nt_a[[0, j]], nt_b[[0, j]]);
+        }
+    }
+
+    /// The two normalization formulas agree for well-scaled vectors but differ
+    /// in their epsilon handling; both produce unit-norm rows here.
+    #[test]
+    fn test_norm_mode_scales() {
+        assert_eq!(NormMode::None.inv_scale(4.0), 1.0);
+        assert!((NormMode::LegacyEps.inv_scale(4.0) - 1.0 / (2.0 + 1e-8)).abs() < 1e-18);
+        assert!((NormMode::L2Clamp.inv_scale(4.0) - 0.5).abs() < 1e-18);
+        // Zero vector: legacy blows up to 1e8, l2 clamps at 1e12.
+        assert!((NormMode::LegacyEps.inv_scale(0.0) - 1e8).abs() < 1.0);
+        assert!((NormMode::L2Clamp.inv_scale(0.0) - 1e12).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_norm_mode_from_str() {
+        assert_eq!(NormMode::from_str("none").unwrap(), NormMode::None);
+        assert_eq!(NormMode::from_str("legacy").unwrap(), NormMode::LegacyEps);
+        assert_eq!(NormMode::from_str("l2").unwrap(), NormMode::L2Clamp);
+        assert!(NormMode::from_str("bogus").is_err());
+    }
+
+    /// D = 1 and a zero-molecule batch must not panic.
+    #[test]
+    fn test_from_hv_degenerate_shapes() {
+        let node_hv = array![[2.0], [3.0]];
+        let edge_index = array![[0_i64, 1], [1, 0]];
+        let batch = Array1::from_vec(vec![0_i64, 0]);
+        let (graph_emb, _) =
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 1, NormMode::None, false);
+        assert_eq!(graph_emb.shape(), &[1, 1]);
+
+        let empty = Array2::<f64>::zeros((0, 8));
+        let (ge, nt) = encode_batch_from_hv(
+            &empty,
+            &Array2::<i64>::zeros((2, 0)),
+            &Array1::<i64>::from_vec(vec![]),
+            0,
+            2,
+            NormMode::L2Clamp,
+            false,
+        );
+        assert_eq!(ge.shape(), &[0, 8]);
+        assert_eq!(nt.shape(), &[0, 8]);
+    }
+
+    // ---- composite_encode_inner ----
+
+    /// A single categorical feature must reproduce its codebook row exactly:
+    /// binding nothing else onto it is the identity.
+    #[test]
+    fn test_composite_single_categorical() {
+        let table = array![[0.1, 0.2, 0.3, 0.4], [-0.5, 0.6, 0.7, -0.8]];
+        let codebooks = vec![FeatureCodebook::Categorical(table.clone())];
+        let values = array![[1.0], [0.0], [1.0]];
+        let out = composite_encode_inner(&values, &codebooks);
+        assert_eq!(out.shape(), &[3, 4]);
+        for j in 0..4 {
+            assert!((out[[0, j]] - table[[1, j]]).abs() < 1e-12);
+            assert!((out[[1, j]] - table[[0, j]]).abs() < 1e-12);
+            assert!((out[[2, j]] - table[[1, j]]).abs() < 1e-12);
+        }
+    }
+
+    /// Two categorical features must bind to their circular convolution.
+    #[test]
+    fn test_composite_two_categorical_is_convolution() {
+        let a = array![[1.0, 2.0, 3.0, 4.0]];
+        let b = array![[0.5, -1.0, 2.0, 0.25]];
+        let codebooks = vec![
+            FeatureCodebook::Categorical(a.clone()),
+            FeatureCodebook::Categorical(b.clone()),
+        ];
+        let out = composite_encode_inner(&array![[0.0, 0.0]], &codebooks);
+        let expected = hrr_bind_rows(&a, &b);
+        for j in 0..4 {
+            assert!((out[[0, j]] - expected[[0, j]]).abs() < 1e-12);
+        }
+    }
+
+    /// Exponent 0 makes the powered spectrum all-ones, whose inverse FFT is
+    /// the HRR identity [1, 0, 0, ...].
+    #[test]
+    fn test_composite_continuous_zero_exponent_is_identity() {
+        let d = 8;
+        let ln_spectrum = Array1::from_shape_fn(d, |k| {
+            Complex64::new(0.3 + k as f64 * 0.1, 0.2 - k as f64 * 0.05).ln()
+        });
+        let codebooks = vec![FeatureCodebook::Continuous {
+            ln_spectrum,
+            bandwidth: 2.0,
+        }];
+        let out = composite_encode_inner(&array![[0.0]], &codebooks);
+        assert!((out[[0, 0]] - 1.0).abs() < 1e-12);
+        for j in 1..d {
+            assert!(out[[0, j]].abs() < 1e-12, "bin {j} = {}", out[[0, j]]);
+        }
+    }
+
+    /// A continuous feature must survive a negative-real DC bin: raising it to
+    /// a non-integer power breaks Hermitian symmetry, and the real part of the
+    /// full complex inverse FFT is what NumPy keeps. A c2r transform would
+    /// give a different answer here, so this pins the branch.
+    #[test]
+    fn test_composite_continuous_negative_dc_bin() {
+        let d = 8;
+        // Hermitian spectrum with a deliberately negative real DC bin.
+        let mut spectrum = vec![Complex64::new(0.0, 0.0); d];
+        spectrum[0] = Complex64::new(-0.75, 0.0);
+        spectrum[4] = Complex64::new(-1.25, 0.0);
+        for k in 1..4 {
+            let z = Complex64::new(0.4 * k as f64, 0.3 - 0.1 * k as f64);
+            spectrum[k] = z;
+            spectrum[d - k] = z.conj();
+        }
+        let ln_spectrum = Array1::from_shape_fn(d, |k| spectrum[k].ln());
+        let codebooks = vec![FeatureCodebook::Continuous {
+            ln_spectrum,
+            bandwidth: 2.0,
+        }];
+        // exponent 1.5 — the case that leaves the real axis.
+        let out = composite_encode_inner(&array![[3.0]], &codebooks);
+        assert_eq!(out.shape(), &[1, d]);
+        assert!(out.iter().all(|v| v.is_finite()));
+        // A Hermitian-assuming transform would drop the discarded imaginary
+        // energy; the real inverse must not be all-zero or symmetric-trivial.
+        assert!(out.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    /// Degenerate shapes must not panic.
+    #[test]
+    fn test_composite_degenerate_shapes() {
+        let table = array![[1.0, 2.0]];
+        let codebooks = vec![FeatureCodebook::Categorical(table)];
+        let out = composite_encode_inner(&Array2::<f64>::zeros((0, 1)), &codebooks);
+        assert_eq!(out.shape(), &[0, 2]);
+
+        let d1 = vec![FeatureCodebook::Categorical(array![[3.0]])];
+        let out = composite_encode_inner(&array![[0.0]], &d1);
+        assert_eq!(out.shape(), &[1, 1]);
+        assert!((out[[0, 0]] - 3.0).abs() < 1e-12);
+
+        let out = composite_encode_inner(&Array2::<f64>::zeros((2, 0)), &[]);
+        assert_eq!(out.shape(), &[2, 0]);
     }
 }

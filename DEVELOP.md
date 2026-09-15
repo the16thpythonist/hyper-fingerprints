@@ -29,11 +29,14 @@ python -c "from hyper_fingerprints._core import encode_batch_rs; print('Rust OK'
 ## Running tests
 
 ```bash
-# Full test suite (76 Python + 9 Rust tests)
+# Full test suite (555 Python tests)
 pytest
 
-# Rust-side unit tests only
-cargo test
+# Rust-side unit tests only. `extension-module` is a default feature, so it has
+# to be off for the test binary to link as a normal executable, and libpython
+# must be on the loader path.
+LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") \
+    cargo test --no-default-features
 
 # Build a wheel, install in clean venv, run tests
 nox -s build_test
