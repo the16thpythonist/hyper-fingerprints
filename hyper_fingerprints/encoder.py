@@ -690,9 +690,10 @@ class Encoder:
     def _encode_node_features(self, x: np.ndarray, *, use_rust: bool = False) -> np.ndarray:
         """Map node feature matrix ``[N, F]`` to hypervectors ``[N, D]``."""
         if self.mode == "composite":
-            if use_rust:
-                return self._node_encoder.encode_rust(x)
-            return self._node_encoder.encode(x)
+            # Encoding depends only on an atom's own feature row, and those rows
+            # repeat heavily across a batch, so each distinct one is computed
+            # once. Bit-identical to encoding every row separately.
+            return self._node_encoder.encode_unique(x, use_rust=use_rust)
         return self._encoder.encode(x)
 
     def _encode_batch(self, batch: GraphBatch) -> dict[str, np.ndarray]:

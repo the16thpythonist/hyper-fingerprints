@@ -410,3 +410,134 @@ class TestBatchInvariance:
         # bonded molecules are batch-invariant in legacy mode too
         for smi in ["CC.O", "CCO", "c1ccccc1"]:
             np.testing.assert_allclose(enc.encode(smi), enc.encode([smi, "CC"])[:1], atol=1e-10)
+
+
+# ─────────────────── Node encoding deduplication ───────────────────
+
+# The Rust node encoder is only a second `base` function for the same dedup
+# wrapper, so both are swept where the extension is available.
+USE_RUST = [False] + ([True] if _HAS_RUST else [])
+
+
+class TestNodeEncodingDedup:
+    """`encode_unique` computes each distinct feature row once.
+
+    The claim is *exact* equality, not closeness: a hypervector depends on
+    nothing but the atom's own feature row, so atoms sharing a row share an
+    answer bitwise. Every assertion here is `array_equal`, never `allclose` --
+    a tolerance would hide precisely the kind of bug worth catching.
+    """
+
+    SMILES = [
+        "CCO", "c1ccccc1", "CC(=O)O", "CC(=O)Nc1ccc(O)cc1", "c1ccncc1",
+        "CC(=O)Oc1ccccc1C(=O)O", "CS(C)=O", "[NH4+]", "CC(=O)[O-]",
+        "C[N+](C)(C)C", "c1cc[nH]c1", "C", "O", "CC.OO",
+    ]
+
+    def _both(self, smiles, use_rust, **kwargs):
+        enc = Encoder(**kwargs)
+        x = enc._prepare_batch_from_list(smiles).x
+        ce = enc._node_encoder
+        base = ce.encode_rust(x) if use_rust else ce.encode(x)
+        return base, ce.encode_unique(x, use_rust=use_rust)
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    @pytest.mark.parametrize("features", [FEATURES_CONTINUOUS, FEATURES_GRAPH_HDC])
+    @pytest.mark.parametrize("dim", [64, 128, 256])
+    @pytest.mark.parametrize("seed", [0, 42])
+    def test_matches_row_by_row(self, use_rust, features, dim, seed):
+        base, deduped = self._both(
+            self.SMILES, use_rust, dimension=dim, depth=2, seed=seed, features=features
+        )
+        assert np.array_equal(deduped, base)
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    def test_unseen_feature_rows(self, use_rust):
+        """Nothing is cached between calls, so there is no "unseen row" case.
+
+        These elements appear in no ordinary organic batch and several fall
+        through to the `unknown_atoms="slot"` row; their feature rows share
+        nothing with the molecules above.
+        """
+        exotic = [
+            "[Se]C(=[Se])[Se]", "[Si](C)(C)(C)C", "[B-](F)(F)(F)F", "C[As](C)C",
+            "[Pt](Cl)(Cl)(N)N", "[U+4]", "C[Hg]Cl", "[Fe+3]", "[Te]",
+        ]
+        base, deduped = self._both(
+            exotic, use_rust, dimension=128, depth=2, seed=42,
+            features=FEATURES_CONTINUOUS, unknown_atoms="slot",
+        )
+        assert np.array_equal(deduped, base)
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    def test_all_rows_distinct(self, use_rust):
+        """Worst case: dedup collapses nothing and must still be exact."""
+        enc = Encoder(dimension=128, depth=1, seed=42, features=FEATURES_CONTINUOUS)
+        ce = enc._node_encoder
+        n = 500
+        x = np.zeros((n, len(FEATURES_CONTINUOUS)))
+        x[:, 0] = np.arange(n) % 9           # element index, in range
+        x[:, 1] = np.arange(n) * 0.001       # continuous, all distinct
+        x[:, 2] = np.arange(n) * 0.002       # continuous, all distinct
+        assert len(np.unique(x, axis=0)) == n
+        base = ce.encode_rust(x) if use_rust else ce.encode(x)
+        assert np.array_equal(ce.encode_unique(x, use_rust=use_rust), base)
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    def test_all_rows_identical(self, use_rust):
+        """Opposite extreme: one distinct row shared by every atom."""
+        base, deduped = self._both(
+            ["c1ccccc1"] * 50, use_rust, dimension=128, depth=1, seed=42,
+            features=FEATURES_CONTINUOUS,
+        )
+        assert np.array_equal(deduped, base)
+        assert len(np.unique(base, axis=0)) == 1
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    def test_degenerate_shapes(self, use_rust):
+        enc = Encoder(dimension=64, depth=1, seed=42, features=FEATURES_CONTINUOUS)
+        ce = enc._node_encoder
+        f = len(FEATURES_CONTINUOUS)
+
+        assert ce.encode_unique(np.zeros((0, f)), use_rust=use_rust).shape == (0, 64)
+
+        one = enc._prepare_batch_from_list(["C"]).x
+        base = ce.encode_rust(one) if use_rust else ce.encode(one)
+        assert np.array_equal(ce.encode_unique(one, use_rust=use_rust), base)
+
+        # 1-d input is promoted to a single row, as `encode` does.
+        single = {"element": {"kind": "categorical"}}
+        enc1 = Encoder(dimension=64, depth=1, seed=42, features=single)
+        ce1 = enc1._node_encoder
+        flat = np.array([2.0, 5.0, 2.0])
+        base1 = ce1.encode_rust(flat) if use_rust else ce1.encode(flat)
+        assert np.array_equal(ce1.encode_unique(flat, use_rust=use_rust), base1)
+
+    @pytest.mark.parametrize("use_rust", USE_RUST)
+    @pytest.mark.parametrize("features", [
+        {"element": {"kind": "categorical"}},
+        {"degree": {"kind": "continuous", "bandwidth": 2.0}},
+        {"element": {"kind": "categorical"}, "charge": {"kind": "categorical"},
+         "aromatic": {"kind": "categorical"}},
+    ])
+    def test_feature_shapes(self, use_rust, features):
+        base, deduped = self._both(
+            self.SMILES, use_rust, dimension=128, depth=1, seed=3, features=features
+        )
+        assert np.array_equal(deduped, base)
+
+    def test_encoder_output_unchanged(self, monkeypatch):
+        """End to end: dedup must not move `Encoder.encode` at all."""
+        from hyper_fingerprints.codebook import CompositeEncoder
+
+        kwargs = dict(dimension=256, depth=3, seed=42, features=FEATURES_GRAPH_HDC,
+                      graph_features=GRAPH_FEATURES_GRAPH_HDC, backend="numpy")
+        with_dedup = Encoder(**kwargs).encode(self.SMILES)
+
+        # Bypass the wrapper so the comparison is against genuine row-by-row work.
+        monkeypatch.setattr(
+            CompositeEncoder, "encode_unique",
+            lambda self, values, *, use_rust=False: self.encode(values),
+        )
+        without_dedup = Encoder(**kwargs).encode(self.SMILES)
+        assert np.array_equal(with_dedup, without_dedup)

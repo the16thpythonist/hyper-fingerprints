@@ -27,15 +27,20 @@ All planned phases are complete. The Rust extension provides a **~22x end-to-end
 
 | Stage | NumPy | Rust | Speedup |
 |---|---|---|---|
-| RDKit preparation (not ported) | 98 ms | 98 ms | 1x |
-| Node encoding (`composite_encode_rs`) | 510 ms | 22.7 ms | ~22x |
+| RDKit preparation (not ported) | 81 ms | 81 ms | 1x |
+| Node encoding (`composite_encode_rs`, after dedup) | 12.6 ms | 10.6 ms | ~1.2x |
 | Message passing (`encode_batch_hv_rs`) | 280 ms | 12 ms | ~24x |
-| **Total** | **845 ms** | **119 ms** | **~7x** |
+| **Total** | **370 ms** | **111 ms** | **~3.3x** |
 
-RDKit preparation is now ~82% of composite runtime. Note also that the atoms in a batch carry
-very few *distinct* feature rows (51 across those 9956 atoms), so deduplicating the node
-encoding by unique row is a bit-identical ~40x on that stage — a cheaper win than this port for
-anyone revisiting the profile.
+Node encoding is also deduplicated by distinct feature row (`CompositeEncoder.encode_unique`),
+which lands *before* either backend and is bit-identical. On molecular input that dominates the
+stage: 9956 atoms carry only 51 distinct rows, so the raw 489 ms NumPy / 25.7 ms Rust cost falls
+to 12.6 ms / 10.6 ms and the two backends nearly converge — what is left is mostly the
+`np.unique` sort.
+
+`composite_encode_rs` therefore earns its keep on input where rows *don't* repeat rather than on
+typical batches: for 9956 all-distinct rows the split is 888 ms (NumPy) vs 39 ms (Rust). RDKit
+preparation is now the largest single item on the Rust backend.
 
 ### Key implementation decisions
 

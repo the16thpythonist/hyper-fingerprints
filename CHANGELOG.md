@@ -36,6 +36,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   all-categorical and single-feature configurations, `unknown_atoms="slot"`,
   and out-of-range index handling.
 
+- Composite node encoding computes each **distinct feature row** once
+  (`CompositeEncoder.encode_unique`) rather than once per atom. A hypervector
+  depends on nothing but the atom's own feature row, so atoms sharing a row
+  share an answer bitwise — the output is `array_equal`, not merely close.
+  Molecules are built from a small alphabet of atom environments: 9956 atoms
+  of 512 PubChem molecules carry only 51 distinct rows, and all six atoms of
+  benzene share one.
+- `tests/test_encoder.py::TestNodeEncodingDedup`: asserts exact equality (never
+  a tolerance) across both presets x dimensions x seeds x both backends, plus
+  exotic elements whose rows appear in no ordinary batch, the all-distinct and
+  all-identical extremes, degenerate shapes, and an end-to-end check that
+  `Encoder.encode` does not move.
+
 ### Changed
 
 - `Cargo.toml`: `extension-module` is now an optional feature, on by default.
@@ -47,10 +60,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Composite molecules are still prepared with RDKit: `prepare_batch_rs` only
   emits flat product-codebook indices, so the Rust SMILES parser covers the
   legacy feature set only.
-- Measured on 512 PubChem molecules (9956 atoms, dim=256, depth=2): message
-  passing ~280 ms -> ~12 ms (~24x), node encoding ~510 ms -> ~23 ms (~22x),
-  end-to-end composite encoding 845 ms -> 119 ms (~7x). RDKit preparation
-  (~98 ms, not ported) is now ~82% of what remains.
+- Measured on 512 PubChem molecules (9956 atoms, dim=256, depth=2). Node
+  encoding: 489 ms -> 12.6 ms on NumPy by dedup alone (~39x), and 25.7 ms ->
+  10.6 ms on Rust. Message passing: ~280 ms -> ~12 ms in Rust (~24x).
+  End-to-end: 845 ms -> 370 ms (NumPy backend) and -> 111 ms (Rust backend),
+  of which RDKit preparation (~81 ms, not ported) is now the largest part.
+- Note that after deduplication the Rust node encoder buys little on typical
+  molecular batches (12.6 ms NumPy vs 10.6 ms Rust) — with only 51 distinct
+  rows the remaining cost is mostly the `np.unique` sort. It still matters
+  when rows do not repeat: on a synthetic batch of 9956 all-distinct rows the
+  split is 888 ms (NumPy) vs 39 ms (Rust).
 - Rust evaluates `z ** e` as `exp(e * ln z)` throughout, while NumPy switches
   to repeated multiplication for real integer exponents with `|e| < 100`.
   Replicating that dispatch was measured and rejected as unnecessary: worst
@@ -63,9 +82,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   even `dim`, its Nyquist bin — is real and often negative, and raising a
   negative real to a non-integer power breaks the Hermitian symmetry that c2r
   assumes.
-- Atoms carry very few *distinct* feature rows (51 across 9956 atoms), so
-  deduplicating the node encoding by unique row is a bit-identical ~40x on
-  that stage. Not done here, but worth knowing before further optimization.
+- Deduplication caches nothing between calls: `np.unique` runs over whatever
+  rows are present, so a row never seen before is encoded from scratch and
+  there is no "unseen data" failure mode. The number of distinct rows affects
+  speed only — an input whose rows are all distinct costs ~4% more than
+  encoding them directly, for the sort.
 
 ## [0.3.1] - 2026-09-11
 

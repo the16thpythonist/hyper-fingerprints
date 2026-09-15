@@ -263,3 +263,33 @@ class CompositeEncoder:
             spectra,
             bandwidths,
         )
+
+    def encode_unique(self, values: np.ndarray, *, use_rust: bool = False) -> np.ndarray:
+        """Encode ``[N, F]`` into ``[N, D]``, computing each distinct row once.
+
+        Bit-identical to :meth:`encode` / :meth:`encode_rust`, not merely close:
+        a row's hypervector depends on nothing but the row itself, so atoms that
+        share a feature row share an answer exactly, and handing them a copy is
+        the same arithmetic rather than an approximation of it.
+
+        Molecules are built from a small alphabet of atom environments, so rows
+        repeat heavily -- 9956 atoms of 512 PubChem molecules carry only 51
+        distinct rows, and all six atoms of benzene share one. Nothing is cached
+        between calls: ``np.unique`` runs over whatever rows are present, so a
+        row never seen before is simply encoded from scratch. The number of
+        distinct rows only affects speed, never the result; an input whose rows
+        are all distinct costs ~4% more than :meth:`encode` for the sort.
+        """
+        base = self.encode_rust if use_rust else self.encode
+
+        values = np.asarray(values, dtype=np.float64)
+        if values.ndim == 1:
+            values = values[:, np.newaxis]
+        if values.shape[0] < 2:
+            return base(values)
+
+        uniq, inv = np.unique(values, axis=0, return_inverse=True)
+        # ravel() is load-bearing: NumPy 2.0 changed the shape of `inverse` for
+        # axis-based calls, and this package supports numpy>=1.24. It is a no-op
+        # on the 1-d result other versions return.
+        return base(uniq)[inv.ravel()]

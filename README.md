@@ -190,10 +190,13 @@ enc = Encoder.from_legacy_codebook("codebook.npz")
 ```
 
 The composite encoder runs on the Rust backend too: both its node encoding (per-feature
-lookups and FHRR fractional powers) and its message passing are Rust-accelerated, ~7x
-end-to-end. All codebook sampling stays in NumPy, so seeded reproducibility is unchanged.
-Composite molecules are still parsed by RDKit — the Rust SMILES parser covers the legacy
-feature set only — which is now the dominant remaining cost.
+lookups and FHRR fractional powers) and its message passing are Rust-accelerated, ~3x
+end-to-end over the NumPy backend. Node encoding additionally computes each *distinct*
+feature row only once — atoms of the same kind share a hypervector exactly — which is a
+~39x saving on the NumPy backend and applies to both. All codebook sampling stays in
+NumPy, so seeded reproducibility is unchanged. Composite molecules are still parsed by
+RDKit — the Rust SMILES parser covers the legacy feature set only — which is now the
+dominant remaining cost.
 
 ## ⚠️ Limitations
 
