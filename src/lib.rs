@@ -41,17 +41,35 @@ impl FftScratch {
     }
 }
 
+/// Error from a numeric kernel, carried back to Python as a `ValueError`.
+///
+/// The FFT transforms reject non-finite input rather than propagating it, so an
+/// overflow anywhere in the pipeline surfaces here instead of aborting the
+/// process. NumPy has no equivalent check and returns `inf`/`NaN` in the same
+/// situation; the messages below therefore name the likely cause so the two
+/// backends are at least equally diagnosable.
+type KernelError = String;
+
+/// Message for a state that overflowed during message passing.
+fn overflow_msg_mp() -> KernelError {
+    "message passing produced non-finite values (inf/NaN): the hypervectors \
+     overflowed. This happens with a large `depth` and `normalize=False`, or \
+     when a small `bandwidth` has already inflated the node hypervectors. Try \
+     `normalize=True`, a smaller `depth`, or a larger `bandwidth`."
+        .to_string()
+}
+
 /// Row-wise circular convolution: for each row i, compute
 /// `ifft(fft(a[i]) * fft(b[i]))`.
 ///
 /// Uses r2c / c2r transforms since inputs are real-valued, giving ~50%
 /// speedup over full complex FFT. Parallelized across rows with rayon.
-fn hrr_bind_rows(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+fn hrr_bind_rows(a: &Array2<f64>, b: &Array2<f64>) -> Result<Array2<f64>, KernelError> {
     let n_rows = a.nrows();
     let d = a.ncols();
 
     if d == 0 || n_rows == 0 {
-        return Array2::zeros((n_rows, d));
+        return Ok(Array2::zeros((n_rows, d)));
     }
 
     let mut planner = RealFftPlanner::<f64>::new();
@@ -71,7 +89,7 @@ fn hrr_bind_rows(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     // Collect output rows in parallel
     let rows: Vec<Vec<f64>> = (0..n_rows)
         .into_par_iter()
-        .map(|i| {
+        .map(|i| -> Result<Vec<f64>, KernelError> {
             let a_row = a.row(i);
             let b_row = b.row(i);
 
@@ -88,10 +106,10 @@ fn hrr_bind_rows(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
                 r2c_ref
                     .process_with_scratch(&mut s.buf_a, &mut s.spec_a, &mut s.scratch_fwd)
-                    .expect("r2c failed");
+                    .map_err(|_| overflow_msg_mp())?;
                 r2c_ref
                     .process_with_scratch(&mut s.buf_b, &mut s.spec_b, &mut s.scratch_fwd)
-                    .expect("r2c failed");
+                    .map_err(|_| overflow_msg_mp())?;
 
                 for k in 0..complex_len {
                     s.spec_a[k] *= s.spec_b[k];
@@ -99,16 +117,16 @@ fn hrr_bind_rows(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
                 c2r_ref
                     .process_with_scratch(&mut s.spec_a, &mut s.buf_a, &mut s.scratch_inv)
-                    .expect("c2r failed");
+                    .map_err(|_| overflow_msg_mp())?;
 
-                s.buf_a.iter().map(|v| v * inv_d).collect::<Vec<f64>>()
+                Ok(s.buf_a.iter().map(|v| v * inv_d).collect::<Vec<f64>>())
             })
         })
-        .collect();
+        .collect::<Result<Vec<Vec<f64>>, KernelError>>()?;
 
     // Assemble into Array2
     let flat: Vec<f64> = rows.into_iter().flatten().collect();
-    Array2::from_shape_vec((n_rows, d), flat).unwrap()
+    Ok(Array2::from_shape_vec((n_rows, d), flat).unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +250,7 @@ fn encode_single_molecule(
     norm_mode: NormMode,
     batch_has_edges: bool,
     empty_identity: bool,
-) -> (Array1<f64>, Array1<f64>) {
+) -> Result<(Array1<f64>, Array1<f64>), KernelError> {
     let n = node_hv.nrows();
     let d = node_hv.ncols();
 
@@ -253,7 +271,7 @@ fn encode_single_molecule(
                 }
             }
 
-            let hr = hrr_bind_rows(&current_layer, &aggregated);
+            let hr = hrr_bind_rows(&current_layer, &aggregated)?;
 
             if norm_mode != NormMode::None {
                 current_layer = Array2::zeros((n, d));
@@ -292,7 +310,7 @@ fn encode_single_molecule(
     let node_term = node_hv.sum_axis(Axis(0));
     let graph_emb = multibundle_sum.sum_axis(Axis(0));
 
-    (graph_emb, node_term)
+    Ok((graph_emb, node_term))
 }
 
 /// Pure-Rust implementation of the full HRR message-passing pipeline.
@@ -306,7 +324,7 @@ fn encode_batch_inner(
     num_graphs: usize,
     depth: usize,
     norm_mode: NormMode,
-) -> (Array2<f64>, Array2<f64>) {
+) -> Result<(Array2<f64>, Array2<f64>), KernelError> {
     let n = feature_indices.len();
     let d = codebook.ncols();
 
@@ -344,7 +362,7 @@ fn encode_batch_from_hv(
     depth: usize,
     norm_mode: NormMode,
     empty_identity: bool,
-) -> (Array2<f64>, Array2<f64>) {
+) -> Result<(Array2<f64>, Array2<f64>), KernelError> {
     let n = node_hv.nrows();
     let d = node_hv.ncols();
     let batch_has_edges = edge_index.ncols() > 0;
@@ -374,7 +392,7 @@ fn encode_batch_from_hv(
     // Step 3: Parallel message-passing per molecule
     let results: Vec<(Array1<f64>, Array1<f64>)> = (0..num_graphs)
         .into_par_iter()
-        .map(|g| {
+        .map(|g| -> Result<(Array1<f64>, Array1<f64>), KernelError> {
             let start = mol_node_start[g];
             let end = mol_node_start[g + 1];
             let mol_nodes = node_hv.slice(s![start..end, ..]).to_owned();
@@ -384,7 +402,7 @@ fn encode_batch_from_hv(
                 depth, norm_mode, batch_has_edges, empty_identity,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, KernelError>>()?;
 
     // Step 4: Assemble output
     let mut graph_embedding = Array2::zeros((num_graphs, d));
@@ -394,7 +412,7 @@ fn encode_batch_from_hv(
         node_terms.row_mut(g).assign(&nt);
     }
 
-    (graph_embedding, node_terms)
+    Ok((graph_embedding, node_terms))
 }
 
 /// Full HRR message-passing encode. Replaces `Encoder._encode_batch()`.
@@ -420,26 +438,28 @@ fn encode_batch_rs<'py>(
     num_graphs: usize,
     depth: usize,
     normalize: bool,
-) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>) {
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
     let codebook = codebook.to_owned_array();
     let feature_indices = feature_indices.to_owned_array();
     let edge_index = edge_index.to_owned_array();
     let batch_indices = batch_indices.to_owned_array();
     let norm_mode = if normalize { NormMode::LegacyEps } else { NormMode::None };
 
-    let (graph_emb, node_terms) = py.detach(|| {
-        encode_batch_inner(
-            &codebook,
-            &feature_indices,
-            &edge_index,
-            &batch_indices,
-            num_graphs,
-            depth,
-            norm_mode,
-        )
-    });
+    let (graph_emb, node_terms) = py
+        .detach(|| {
+            encode_batch_inner(
+                &codebook,
+                &feature_indices,
+                &edge_index,
+                &batch_indices,
+                num_graphs,
+                depth,
+                norm_mode,
+            )
+        })
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
-    (graph_emb.into_pyarray(py), node_terms.into_pyarray(py))
+    Ok((graph_emb.into_pyarray(py), node_terms.into_pyarray(py)))
 }
 
 /// HRR message passing over pre-computed node hypervectors.
@@ -484,17 +504,19 @@ fn encode_batch_hv_rs<'py>(
         )));
     }
 
-    let (graph_emb, node_terms) = py.detach(|| {
-        encode_batch_from_hv(
-            &node_hv,
-            &edge_index,
-            &batch_indices,
-            num_graphs,
-            depth,
-            norm_mode,
-            empty_identity,
-        )
-    });
+    let (graph_emb, node_terms) = py
+        .detach(|| {
+            encode_batch_from_hv(
+                &node_hv,
+                &edge_index,
+                &batch_indices,
+                num_graphs,
+                depth,
+                norm_mode,
+                empty_identity,
+            )
+        })
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     Ok((graph_emb.into_pyarray(py), node_terms.into_pyarray(py)))
 }
@@ -585,7 +607,7 @@ impl CompositeScratch {
 fn composite_encode_inner(
     values: &Array2<f64>,
     codebooks: &[FeatureCodebook],
-) -> Array2<f64> {
+) -> Result<Array2<f64>, KernelError> {
     let n = values.nrows();
     let d = match codebooks.first() {
         Some(FeatureCodebook::Categorical(table)) => table.ncols(),
@@ -594,7 +616,7 @@ fn composite_encode_inner(
     };
 
     if n == 0 || d == 0 {
-        return Array2::zeros((n, d));
+        return Ok(Array2::zeros((n, d)));
     }
 
     let mut planner = RealFftPlanner::<f64>::new();
@@ -614,7 +636,7 @@ fn composite_encode_inner(
 
     let rows: Vec<Vec<f64>> = (0..n)
         .into_par_iter()
-        .map(|i| {
+        .map(|i| -> Result<Vec<f64>, KernelError> {
             SCRATCH.with(|cell| {
                 let mut borrow = cell.borrow_mut();
                 if borrow.as_ref().map_or(true, |(sz, _)| *sz != d) {
@@ -648,6 +670,17 @@ fn composite_encode_inner(
                             for k in 0..d {
                                 s.full[k] = (ln_spectrum[k] * e).exp();
                             }
+                            // `spectrum ** e` overflows for a large |e|, which a
+                            // small bandwidth produces from an ordinary feature
+                            // value. Report it rather than letting a non-finite
+                            // spectrum reach (and abort) the transform below.
+                            if s.full.iter().any(|z| !z.re.is_finite() || !z.im.is_finite()) {
+                                return Err(format!(
+                                    "feature {f}: value {value} / bandwidth {bandwidth} gives \
+                                     exponent {e}, and `spectrum ** {e}` overflowed to non-finite \
+                                     values. Use a larger bandwidth for this feature."
+                                ));
+                            }
                             // Full complex inverse FFT; rustfft is unnormalized.
                             cfft_ref.process_with_scratch(&mut s.full, &mut s.fft_scratch);
                             for k in 0..d {
@@ -658,7 +691,9 @@ fn composite_encode_inner(
 
                     r2c_ref
                         .process_with_scratch(&mut s.real, &mut s.spec, &mut s.r2c_scratch)
-                        .expect("r2c failed");
+                        .map_err(|_| format!(
+                            "feature {f}: node encoding produced non-finite values (inf/NaN)"
+                        ))?;
                     for k in 0..complex_len {
                         s.acc[k] *= s.spec[k];
                     }
@@ -666,14 +701,18 @@ fn composite_encode_inner(
 
                 c2r_ref
                     .process_with_scratch(&mut s.acc, &mut s.real, &mut s.c2r_scratch)
-                    .expect("c2r failed");
-                s.real.iter().map(|v| v * inv_d).collect::<Vec<f64>>()
+                    .map_err(|_| {
+                        "node encoding produced non-finite values (inf/NaN) when binding the \
+                         per-feature hypervectors together"
+                            .to_string()
+                    })?;
+                Ok(s.real.iter().map(|v| v * inv_d).collect::<Vec<f64>>())
             })
         })
-        .collect();
+        .collect::<Result<Vec<Vec<f64>>, KernelError>>()?;
 
     let flat: Vec<f64> = rows.into_iter().flatten().collect();
-    Array2::from_shape_vec((n, d), flat).unwrap()
+    Ok(Array2::from_shape_vec((n, d), flat).unwrap())
 }
 
 /// Composite node encoding: feature values `[N, F]` -> hypervectors `[N, D]`.
@@ -794,7 +833,9 @@ fn composite_encode_rs<'py>(
         }
     }
 
-    let out = py.detach(|| composite_encode_inner(&values, &codebooks));
+    let out = py
+        .detach(|| composite_encode_inner(&values, &codebooks))
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -1016,7 +1057,7 @@ mod tests {
         let v = Array2::from_shape_vec((1, d), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
             .unwrap();
 
-        let result = hrr_bind_rows(&v, &identity);
+        let result = hrr_bind_rows(&v, &identity).unwrap();
 
         for j in 0..d {
             assert!(
@@ -1035,8 +1076,8 @@ mod tests {
         let a = array![[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]];
         let b = array![[0.5, -1.0, 0.3, 2.0], [-0.1, 0.7, 1.2, -0.5]];
 
-        let ab = hrr_bind_rows(&a, &b);
-        let ba = hrr_bind_rows(&b, &a);
+        let ab = hrr_bind_rows(&a, &b).unwrap();
+        let ba = hrr_bind_rows(&b, &a).unwrap();
 
         for i in 0..2 {
             for j in 0..4 {
@@ -1057,7 +1098,7 @@ mod tests {
     fn test_bind_empty() {
         let a = Array2::<f64>::zeros((0, 4));
         let b = Array2::<f64>::zeros((0, 4));
-        let result = hrr_bind_rows(&a, &b);
+        let result = hrr_bind_rows(&a, &b).unwrap();
         assert_eq!(result.shape(), &[0, 4]);
     }
 
@@ -1066,7 +1107,7 @@ mod tests {
     fn test_bind_d1() {
         let a = array![[3.0]];
         let b = array![[5.0]];
-        let result = hrr_bind_rows(&a, &b);
+        let result = hrr_bind_rows(&a, &b).unwrap();
         assert!((result[[0, 0]] - 15.0).abs() < 1e-12);
     }
 
@@ -1153,7 +1194,7 @@ mod tests {
     fn test_from_hv_edgeless_zeros() {
         let (node_hv, edge_index, batch) = edgeless_batch();
         let (graph_emb, node_terms) =
-            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, false);
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, false).unwrap();
         for g in 0..2 {
             for j in 0..4 {
                 assert!((graph_emb[[g, j]] - node_hv[[g, j]]).abs() < 1e-12);
@@ -1169,7 +1210,7 @@ mod tests {
     fn test_from_hv_edgeless_identity() {
         let (node_hv, edge_index, batch) = edgeless_batch();
         let (graph_emb, _) =
-            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, true);
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 2, 3, NormMode::None, true).unwrap();
         for g in 0..2 {
             for j in 0..4 {
                 assert!((graph_emb[[g, j]] - 4.0 * node_hv[[g, j]]).abs() < 1e-12);
@@ -1187,14 +1228,14 @@ mod tests {
         let batch = Array1::from_vec(vec![0_i64, 0, 0]);
 
         let (via_codebook, nt_a) =
-            encode_batch_inner(&codebook, &feature_indices, &edge_index, &batch, 1, 2, NormMode::LegacyEps);
+            encode_batch_inner(&codebook, &feature_indices, &edge_index, &batch, 1, 2, NormMode::LegacyEps).unwrap();
 
         let mut node_hv = Array2::zeros((3, 4));
         for i in 0..3 {
             node_hv.row_mut(i).assign(&codebook.row(feature_indices[i] as usize));
         }
         let (via_hv, nt_b) =
-            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 2, NormMode::LegacyEps, true);
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 2, NormMode::LegacyEps, true).unwrap();
 
         for j in 0..4 {
             assert_eq!(via_codebook[[0, j]], via_hv[[0, j]]);
@@ -1229,7 +1270,7 @@ mod tests {
         let edge_index = array![[0_i64, 1], [1, 0]];
         let batch = Array1::from_vec(vec![0_i64, 0]);
         let (graph_emb, _) =
-            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 1, NormMode::None, false);
+            encode_batch_from_hv(&node_hv, &edge_index, &batch, 1, 1, NormMode::None, false).unwrap();
         assert_eq!(graph_emb.shape(), &[1, 1]);
 
         let empty = Array2::<f64>::zeros((0, 8));
@@ -1241,7 +1282,7 @@ mod tests {
             2,
             NormMode::L2Clamp,
             false,
-        );
+        ).unwrap();
         assert_eq!(ge.shape(), &[0, 8]);
         assert_eq!(nt.shape(), &[0, 8]);
     }
@@ -1255,7 +1296,7 @@ mod tests {
         let table = array![[0.1, 0.2, 0.3, 0.4], [-0.5, 0.6, 0.7, -0.8]];
         let codebooks = vec![FeatureCodebook::Categorical(table.clone())];
         let values = array![[1.0], [0.0], [1.0]];
-        let out = composite_encode_inner(&values, &codebooks);
+        let out = composite_encode_inner(&values, &codebooks).unwrap();
         assert_eq!(out.shape(), &[3, 4]);
         for j in 0..4 {
             assert!((out[[0, j]] - table[[1, j]]).abs() < 1e-12);
@@ -1273,8 +1314,8 @@ mod tests {
             FeatureCodebook::Categorical(a.clone()),
             FeatureCodebook::Categorical(b.clone()),
         ];
-        let out = composite_encode_inner(&array![[0.0, 0.0]], &codebooks);
-        let expected = hrr_bind_rows(&a, &b);
+        let out = composite_encode_inner(&array![[0.0, 0.0]], &codebooks).unwrap();
+        let expected = hrr_bind_rows(&a, &b).unwrap();
         for j in 0..4 {
             assert!((out[[0, j]] - expected[[0, j]]).abs() < 1e-12);
         }
@@ -1292,7 +1333,7 @@ mod tests {
             ln_spectrum,
             bandwidth: 2.0,
         }];
-        let out = composite_encode_inner(&array![[0.0]], &codebooks);
+        let out = composite_encode_inner(&array![[0.0]], &codebooks).unwrap();
         assert!((out[[0, 0]] - 1.0).abs() < 1e-12);
         for j in 1..d {
             assert!(out[[0, j]].abs() < 1e-12, "bin {j} = {}", out[[0, j]]);
@@ -1321,7 +1362,7 @@ mod tests {
             bandwidth: 2.0,
         }];
         // exponent 1.5 — the case that leaves the real axis.
-        let out = composite_encode_inner(&array![[3.0]], &codebooks);
+        let out = composite_encode_inner(&array![[3.0]], &codebooks).unwrap();
         assert_eq!(out.shape(), &[1, d]);
         assert!(out.iter().all(|v| v.is_finite()));
         // A Hermitian-assuming transform would drop the discarded imaginary
@@ -1334,15 +1375,69 @@ mod tests {
     fn test_composite_degenerate_shapes() {
         let table = array![[1.0, 2.0]];
         let codebooks = vec![FeatureCodebook::Categorical(table)];
-        let out = composite_encode_inner(&Array2::<f64>::zeros((0, 1)), &codebooks);
+        let out = composite_encode_inner(&Array2::<f64>::zeros((0, 1)), &codebooks).unwrap();
         assert_eq!(out.shape(), &[0, 2]);
 
         let d1 = vec![FeatureCodebook::Categorical(array![[3.0]])];
-        let out = composite_encode_inner(&array![[0.0]], &d1);
+        let out = composite_encode_inner(&array![[0.0]], &d1).unwrap();
         assert_eq!(out.shape(), &[1, 1]);
         assert!((out[[0, 0]] - 3.0).abs() < 1e-12);
 
-        let out = composite_encode_inner(&Array2::<f64>::zeros((2, 0)), &[]);
+        let out = composite_encode_inner(&Array2::<f64>::zeros((2, 0)), &[]).unwrap();
         assert_eq!(out.shape(), &[2, 0]);
+    }
+
+    // ---- non-finite input returns Err instead of aborting the process ----
+
+    /// A non-finite node hypervector must surface as an error, not a panic:
+    /// a panic crosses into Python as `PanicException`, which derives from
+    /// `BaseException` and so escapes a caller's `except Exception`.
+    #[test]
+    fn test_message_passing_nonfinite_is_error() {
+        let mut node_hv = Array2::<f64>::ones((2, 8));
+        node_hv[[0, 0]] = f64::INFINITY;
+        let edge_index = array![[0_i64, 1], [1, 0]];
+        let batch = Array1::from_vec(vec![0_i64, 0]);
+        let err = encode_batch_from_hv(
+            &node_hv, &edge_index, &batch, 1, 1, NormMode::None, false,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-finite"), "unhelpful message: {err}");
+
+        // NaN takes the same route.
+        node_hv[[0, 0]] = f64::NAN;
+        assert!(encode_batch_from_hv(
+            &node_hv, &edge_index, &batch, 1, 1, NormMode::None, false,
+        )
+        .is_err());
+    }
+
+    /// A bandwidth small enough to overflow `spectrum ** e` must name the
+    /// offending feature, its value and the resulting exponent.
+    #[test]
+    fn test_composite_overflow_is_error() {
+        let d = 8;
+        let ln_spectrum = Array1::from_shape_fn(d, |k| {
+            Complex64::new(2.5 + k as f64, 1.0).ln()
+        });
+        let codebooks = vec![FeatureCodebook::Continuous {
+            ln_spectrum,
+            bandwidth: 1e-300,
+        }];
+        let err = composite_encode_inner(&array![[3.0]], &codebooks).unwrap_err();
+        assert!(err.contains("overflow"), "unhelpful message: {err}");
+        assert!(err.contains("bandwidth"), "message should name bandwidth: {err}");
+    }
+
+    /// A finite input still succeeds after the error plumbing was added.
+    #[test]
+    fn test_finite_input_still_ok() {
+        let node_hv = array![[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, 0.25]];
+        let edge_index = array![[0_i64, 1], [1, 0]];
+        let batch = Array1::from_vec(vec![0_i64, 0]);
+        assert!(encode_batch_from_hv(
+            &node_hv, &edge_index, &batch, 1, 2, NormMode::L2Clamp, false,
+        )
+        .is_ok());
     }
 }

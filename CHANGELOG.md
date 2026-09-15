@@ -43,14 +43,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Molecules are built from a small alphabet of atom environments: 9956 atoms
   of 512 PubChem molecules carry only 51 distinct rows, and all six atoms of
   benzene share one.
+- `tests/test_rust_backend.py::TestCompositeSweep`: sweeps the axes the suite
+  previously pinned -- every seed x dimension (including 3 and 8), depth out to
+  6, batch sizes 1-200, bandwidths 0.25-1e6, and the cross product of
+  `graph_mode` x `bidirectional` x `unknown_atoms` -- plus a deterministic
+  pseudo-random sweep over the whole option space, which is the shape of test
+  that found the crashes above.
+- `tests/test_rust_backend.py::TestNumericalLimits`: pins overflow as a
+  catchable `ValueError` at both sites, that a failed call leaves the process
+  usable, and the two regimes where the backends genuinely part company --
+  depth > 6 (message passing is ill-conditioned, so agreement degrades from
+  ~1e-13 to ~1e-9 by depth 8 and becomes arbitrary near the float64 ceiling)
+  and a bandwidth far below the value range (~5.6e-7, where magnitudes reach
+  1e63 and the result is meaningless on either backend). Depth 6 is documented
+  as the supported range for tight agreement; through it the worst measured
+  deviation over 100 real PubChem molecules, dims 64-512, both feature kinds
+  and both `normalize` settings is 4.6e-13.
 - `tests/test_encoder.py::TestNodeEncodingDedup`: asserts exact equality (never
   a tolerance) across both presets x dimensions x seeds x both backends, plus
   exotic elements whose rows appear in no ordinary batch, the all-distinct and
   all-identical extremes, degenerate shapes, and an end-to-end check that
   `Encoder.encode` does not move.
 
+### Fixed
+
+- Overflow in the Rust backend raised `pyo3_runtime.PanicException` and printed
+  a panic per affected row to stderr. That type derives from `BaseException`,
+  not `Exception`, so a caller's `try: enc.encode(chunk) except Exception:`
+  loop did not catch it and the whole job died. Both FFT sites now return an
+  error that surfaces as a catchable `ValueError` naming the likely cause.
+  Two ways in: a `bandwidth` far below the feature's value range (new with the
+  composite node encoder), and large `depth` with `normalize=False` (reachable
+  in legacy mode too, so pre-existing). The NumPy backend still returns
+  inf/NaN in these situations; the asymmetry is documented rather than changed.
+
 ### Changed
 
+- Composite cross-backend parity is now measured as deviation scaled by each
+  **row's own magnitude**, replacing a global `atol=1e-10, rtol=1e-11`. The old
+  pair was not a meaningful statement about agreement: unnormalized composite
+  embeddings reach ~1e7 at depth 3 and ~1e15 at depth 4 and the magnitude moves
+  with the seed, so it consumed 99% of its budget at seed 42 / dim 128 /
+  depth 3 and would have **failed** at seed 7 (7.6x over) or seed 1 / depth 4
+  (16.5x over). The suite was green by seed luck. Row-scaled deviation is
+  stable: worst 4.1e-13 across dims {3,8,64,128,256,512} x seeds {0,1,7,42,123}
+  x depth 0-3 x normalize {True,False}, so the new 1e-9 bound has ~400x
+  headroom.
 - `Cargo.toml`: `extension-module` is now an optional feature, on by default.
   `cargo test` could not link before this — the Rust unit tests now run with
   `cargo test --no-default-features` (with libpython on `LD_LIBRARY_PATH`).

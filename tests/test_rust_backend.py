@@ -276,10 +276,38 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 
 
-# Unnormalized composite embeddings grow quickly with depth (magnitudes reach
-# ~1e6 at depth 3), so parity is asserted relatively as well as absolutely.
-# Observed worst-case relative deviation across this matrix is ~6e-12.
-RTOL = 1e-11
+# Composite parity is measured as deviation scaled by each ROW's own magnitude.
+#
+# A global `atol`/`rtol` pair is close to meaningless here: unnormalized
+# composite embeddings reach ~1e7 at depth 3 and ~1e15 at depth 4, and the
+# magnitude swings with the seed, so any fixed absolute budget is really a
+# statement about whichever seed was chosen. The previous `atol=1e-10,
+# rtol=1e-11` consumed 99% of its budget at seed 42 / dim 128 / depth 3 and
+# would have FAILED at seed 7 (7.6x over) or seed 1 / depth 4 (16.5x over) --
+# the suite was green by seed luck rather than by agreement.
+#
+# Row-scaled deviation is stable instead: measured worst across dims
+# {3,8,64,128,256,512} x seeds {0,1,7,42,123} x depth 0-3 x normalize {T,F} is
+# 4.1e-13, and 2.5e-12 out to depth 6. ROW_TOL leaves ~400x headroom over that,
+# so a real regression trips it and a seed change does not.
+ROW_TOL = 1e-9
+
+
+def row_scaled_deviation(rs: np.ndarray, py: np.ndarray) -> float:
+    """Max |rs - py| scaled by the magnitude of the row it occurs in."""
+    scale = np.maximum(np.abs(py).max(axis=-1, keepdims=True), 1e-300)
+    return float((np.abs(rs - py) / scale).max())
+
+
+def assert_backends_agree(rs: np.ndarray, py: np.ndarray, tol: float = ROW_TOL) -> None:
+    assert rs.shape == py.shape, f"shape {rs.shape} != {py.shape}"
+    assert np.all(np.isfinite(py)) == np.all(np.isfinite(rs)), (
+        "backends disagree on whether the result is finite"
+    )
+    if not np.all(np.isfinite(py)):
+        return  # both non-finite: nothing meaningful to compare
+    dev = row_scaled_deviation(rs, py)
+    assert dev <= tol, f"row-scaled deviation {dev:.3e} exceeds {tol:.1e}"
 
 
 class TestCompositeCrossBackend:
@@ -301,9 +329,8 @@ class TestCompositeCrossBackend:
         enc_rs = Encoder(backend="rust", **kwargs)
         enc_py = Encoder(backend="numpy", **kwargs)
         rs, py = enc_rs.encode(smiles), enc_py.encode(smiles)
-        np.testing.assert_allclose(rs, py, atol=ATOL, rtol=RTOL)
-        rs_j, py_j = enc_rs.encode_joint(smiles), enc_py.encode_joint(smiles)
-        np.testing.assert_allclose(rs_j, py_j, atol=ATOL, rtol=RTOL)
+        assert_backends_agree(rs, py)
+        assert_backends_agree(enc_rs.encode_joint(smiles), enc_py.encode_joint(smiles))
         return rs
 
     @pytest.mark.parametrize("features", [FEATURES_CONTINUOUS, FEATURES_GRAPH_HDC])
@@ -361,7 +388,7 @@ class TestCompositeCrossBackend:
         kwargs = dict(dimension=128, depth=2, seed=42, features=FEATURES_CONTINUOUS)
         alone = self._assert_match(["C"], **kwargs)
         batched = self._assert_match(["C", "CCO"], **kwargs)
-        np.testing.assert_allclose(alone[0], batched[0], atol=ATOL, rtol=RTOL)
+        assert_backends_agree(alone[0][None], batched[0][None])
 
     def test_all_edgeless_batch(self):
         """Every molecule bondless: composite scatters to zeros, so layers
@@ -372,7 +399,7 @@ class TestCompositeCrossBackend:
                                 features=FEATURES_CONTINUOUS)
         # Order-N must equal order-0 here (no message passing contributes).
         joint = enc.encode_joint(["C", "O", "N"])
-        np.testing.assert_allclose(joint[:, :128], rs, atol=ATOL, rtol=RTOL)
+        assert_backends_agree(joint[:, :128], rs)
 
     def test_disconnected_and_empty_input(self):
         self._assert_match(["CC.OO", "C.C.C"], dimension=128, depth=2, seed=42,
@@ -386,7 +413,7 @@ class TestCompositeCrossBackend:
         kwargs = dict(dimension=128, depth=2, seed=42, features=FEATURES_CONTINUOUS)
         from_smiles = self._assert_match(self.SMILES, **kwargs)
         from_mols = self._assert_match(mols, **kwargs)
-        np.testing.assert_allclose(from_smiles, from_mols, atol=ATOL, rtol=RTOL)
+        assert_backends_agree(from_smiles, from_mols)
 
     def test_large_batch_parallel(self):
         """Exercises the rayon fan-out across molecules."""
@@ -406,10 +433,7 @@ class TestCompositeCrossBackend:
         path = tmp_path / "composite.npz"
         enc.save(path)
         loaded_rs = Encoder.load(path, backend="rust")
-        np.testing.assert_allclose(
-            loaded_rs.encode(self.SMILES), enc.encode(self.SMILES),
-            atol=ATOL, rtol=RTOL,
-        )
+        assert_backends_agree(loaded_rs.encode(self.SMILES), enc.encode(self.SMILES))
 
 
 # ---------------------------------------------------------------------------
@@ -566,3 +590,316 @@ class TestCompositeNodeEncoding:
         x = enc._prepare_batch_from_list(self.SMILES).x
         ce = enc._node_encoder
         np.testing.assert_array_equal(ce.encode_rust(x), ce.encode_rust(x))
+
+
+# ---------------------------------------------------------------------------
+# Broad parameter sweeps
+# ---------------------------------------------------------------------------
+
+SWEEP_SMILES = [
+    "CCO", "c1ccccc1", "CC(=O)O", "CC(=O)Nc1ccc(O)cc1", "c1ccncc1",
+    "CC(=O)Oc1ccccc1C(=O)O", "CS(C)=O", "[NH4+]", "CC(=O)[O-]", "C", "O",
+    "CC.OO", "C[N+](C)(C)C", "c1cc[nH]c1", "FC(F)(F)c1ccccc1", "OP(O)(O)=O",
+]
+
+
+class TestCompositeSweep:
+    """Cross-backend agreement over a wide parameter grid.
+
+    The earlier suite pinned a single seed (42), dimensions no smaller than 128
+    and depth no greater than 3, which left the tolerance resting on seed luck
+    and never exercised the regimes where the backends actually part company.
+    These sweeps vary every axis that turned out to matter.
+    """
+
+    @pytest.mark.parametrize("dim", [3, 8, 64, 128, 256, 512])
+    @pytest.mark.parametrize("seed", [0, 1, 7, 42, 123])
+    def test_seed_and_dimension_grid(self, dim, seed):
+        """Every seed x dimension, across depth and normalize.
+
+        Seed matters because it sets the sign of the spectrum's DC and Nyquist
+        bins, which decides whether the non-Hermitian branch of the continuous
+        encoder is exercised at all. Dimension matters because odd dimensions
+        have no Nyquist bin.
+        """
+        for depth in (0, 1, 2, 3):
+            for normalize in (True, False):
+                kw = dict(dimension=dim, depth=depth, seed=seed,
+                          normalize=normalize, features=FEATURES_CONTINUOUS)
+                py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
+                rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
+                assert_backends_agree(rs, py)
+
+    @pytest.mark.parametrize("depth", [4, 5, 6])
+    @pytest.mark.parametrize("normalize", [True, False])
+    def test_deeper_than_the_old_matrix(self, depth, normalize):
+        """Depth 4-6 was previously untested; error grows ~3x per layer."""
+        for seed in (0, 42, 123):
+            kw = dict(dimension=256, depth=depth, seed=seed,
+                      normalize=normalize, features=FEATURES_CONTINUOUS)
+            py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
+            rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
+            assert_backends_agree(rs, py)
+
+    @pytest.mark.parametrize("bandwidth", [0.25, 1.0, 2.0, 7.5, 100.0, 1e6])
+    def test_bandwidth_range(self, bandwidth):
+        """Bandwidth sets the exponent scale (`exponent = value / bandwidth`).
+
+        Bounded below at 0.25 deliberately: feature values here reach 5, so
+        smaller bandwidths push the exponent past ~20 and are covered by
+        `test_tiny_bandwidth_diverges` instead.
+        """
+        feats = {"element": {"kind": "categorical"},
+                 "degree": {"kind": "continuous", "bandwidth": bandwidth},
+                 "charge": {"kind": "continuous", "bandwidth": bandwidth}}
+        for seed in (0, 7, 42):
+            kw = dict(dimension=128, depth=2, seed=seed, features=feats)
+            py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
+            rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
+            assert_backends_agree(rs, py)
+
+    def test_tiny_bandwidth_diverges(self):
+        """Pins the one regime where the backends measurably disagree.
+
+        A bandwidth far below the feature's value range drives the exponent
+        large (`degree=3 / 0.05 = 60`), and `spectrum ** 60` sends the
+        embedding to ~1e63. Rust evaluates `z ** e` as `exp(e * ln z)` while
+        NumPy switches to repeated multiplication for real integer exponents
+        with `|e| < 100`; at that magnitude the two differ by ~5.6e-7
+        relative, well past `ROW_TOL`.
+
+        This is the documented cost of not replicating NumPy's `npy_cpow`
+        internals, not a defect -- and an embedding of 1e63 is numerically
+        useless on *either* backend, so the real lesson is to keep bandwidth on
+        the order of the feature's value range. The assertion is deliberately
+        two-sided: it fails if the divergence grows, and also if it silently
+        disappears (which would mean this documentation went stale).
+        """
+        feats = {"element": {"kind": "categorical"},
+                 "degree": {"kind": "continuous", "bandwidth": 0.05},
+                 "charge": {"kind": "continuous", "bandwidth": 0.05}}
+        kw = dict(dimension=128, depth=2, seed=7, features=feats)
+        py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
+        rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
+
+        assert np.abs(py).max() > 1e40, "expected the embedding to blow up here"
+        dev = row_scaled_deviation(rs, py)
+        assert 1e-9 < dev < 1e-4, f"divergence moved to {dev:.2e}; update the docs"
+
+    @pytest.mark.parametrize("n", [1, 2, 3, 17, 64, 200])
+    def test_batch_sizes(self, n):
+        """Composite mode is batch-invariant, so batch size must not matter."""
+        mols = (SWEEP_SMILES * 20)[:n]
+        kw = dict(dimension=128, depth=3, seed=1, features=FEATURES_CONTINUOUS)
+        py = Encoder(**kw, backend="numpy").encode(mols)
+        rs = Encoder(**kw, backend="rust").encode(mols)
+        assert_backends_agree(rs, py)
+        assert rs.shape == (n, 128)
+
+    @pytest.mark.parametrize("graph_mode", ["bundle", "bind", "concat"])
+    @pytest.mark.parametrize("bidirectional", [True, False])
+    @pytest.mark.parametrize("unknown_atoms", ["error", "slot"])
+    def test_option_combinations(self, graph_mode, bidirectional, unknown_atoms):
+        """The cross product of the switches, over several seeds."""
+        mols = SWEEP_SMILES + (["[Se]C", "[Si](C)(C)C"] if unknown_atoms == "slot" else [])
+        for seed in (0, 42):
+            kw = dict(dimension=128, depth=3, seed=seed, normalize=True,
+                      features=FEATURES_GRAPH_HDC,
+                      graph_features=GRAPH_FEATURES_GRAPH_HDC,
+                      graph_mode=graph_mode, bidirectional=bidirectional,
+                      unknown_atoms=unknown_atoms)
+            py = Encoder(**kw, backend="numpy").encode(mols)
+            rs = Encoder(**kw, backend="rust").encode(mols)
+            assert_backends_agree(rs, py)
+
+    def test_randomized_configurations(self):
+        """Deterministic pseudo-random sweep over the whole option space.
+
+        A sweep of this shape is what surfaced the two crash sites and the
+        seed-luck tolerance; keeping one in the suite means the next such bug
+        fails a test rather than a user's job. The RNG seed is fixed so a
+        failure is reproducible.
+        """
+        import random
+
+        rng = random.Random(20260915)
+        all_feats = ["element", "degree", "charge", "hydrogens",
+                     "implicit_hydrogens", "aromatic"]
+        checked = 0
+
+        for _ in range(60):
+            names = rng.sample(all_feats, rng.randint(1, len(all_feats)))
+            feats = {}
+            for nm in names:
+                if nm != "element" and rng.random() < 0.5:
+                    feats[nm] = {"kind": "continuous",
+                                 "bandwidth": rng.choice([0.5, 1.0, 2.0, 3.3, 11.0])}
+                else:
+                    feats[nm] = {"kind": "categorical"}
+            gfeats = None
+            if rng.random() < 0.5:
+                gfeats = {nm: {"kind": "continuous",
+                               "bandwidth": rng.choice([1.0, 4.0, 18.5])}
+                          for nm in rng.sample(
+                              ["graph_size", "graph_diameter", "graph_total_charge"],
+                              rng.randint(1, 3))}
+            kw = dict(
+                dimension=rng.choice([3, 8, 16, 64, 127, 128, 256, 384]),
+                depth=rng.choice([0, 1, 2, 3, 4]),
+                seed=rng.randrange(10_000),
+                normalize=rng.choice([True, False]),
+                bidirectional=rng.choice([True, False]),
+                graph_mode=rng.choice(["bundle", "bind", "concat"]),
+                unknown_atoms=rng.choice(["error", "slot"]),
+                features=feats,
+                graph_features=gfeats,
+            )
+            mols = rng.sample(SWEEP_SMILES, rng.choice([1, 2, 5, 12]))
+
+            py_enc = Encoder(**kw, backend="numpy")
+            rs_enc = Encoder(**kw, backend="rust")
+            for fn in ("encode", "encode_joint"):
+                py = getattr(py_enc, fn)(mols)
+                # A config that overflows must fail cleanly, not abort the
+                # process; PanicException would not be caught by `except
+                # Exception` and would take the whole run down.
+                try:
+                    rs = getattr(rs_enc, fn)(mols)
+                except ValueError:
+                    assert not np.all(np.isfinite(py)), (
+                        f"rust rejected a config NumPy handled finitely: {kw}"
+                    )
+                    continue
+                assert_backends_agree(rs, py)
+                checked += 1
+
+        assert checked > 100, f"sweep only compared {checked} results"
+
+
+class TestNumericalLimits:
+    """Overflow must surface as a catchable error, never abort the process.
+
+    A Rust `panic!` reaches Python as `pyo3_runtime.PanicException`, which
+    derives from `BaseException` rather than `Exception`. A caller looping over
+    a dataset with `try: enc.encode(chunk) except Exception:` would not catch
+    it and the whole job would die. Both FFT sites therefore return an error
+    that PyO3 converts to `ValueError`.
+    """
+
+    def test_tiny_bandwidth_raises_valueerror(self):
+        """Node encoding: `spectrum ** e` overflows for a huge exponent."""
+        feats = {"element": {"kind": "categorical"},
+                 "degree": {"kind": "continuous", "bandwidth": 1e-6}}
+        enc = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust")
+        with pytest.raises(ValueError) as excinfo:
+            enc.encode(["CCO"])
+        msg = str(excinfo.value)
+        assert "bandwidth" in msg, f"message should name the cause: {msg}"
+        assert "overflow" in msg.lower()
+
+    def test_deep_unnormalized_raises_valueerror(self):
+        """Message passing: the state overflows at large depth without
+        normalization. Reachable in legacy mode too, so both are checked."""
+        mols = ["CC(=O)Oc1ccccc1C(=O)O", "c1ccc2c(c1)cccc2", "CCCCCCCCCC"] * 10
+        for features in (None, FEATURES_CONTINUOUS):
+            kw = dict(dimension=512, depth=14, seed=1, normalize=False, backend="rust")
+            if features is not None:
+                kw["features"] = features
+            with pytest.raises(ValueError) as excinfo:
+                Encoder(**kw).encode(mols)
+            assert "non-finite" in str(excinfo.value)
+
+    def test_error_is_catchable_and_state_survives(self):
+        """`except Exception` must catch it, and the encoder must still work."""
+        feats = {"element": {"kind": "categorical"},
+                 "degree": {"kind": "continuous", "bandwidth": 1e-6}}
+        bad = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust")
+        caught = 0
+        for _ in range(3):
+            try:
+                bad.encode(["CCO"])
+            except Exception:       # deliberately not BaseException
+                caught += 1
+        assert caught == 3
+
+        # A healthy encoder in the same process is unaffected.
+        good = Encoder(dimension=64, depth=2, seed=0,
+                       features=FEATURES_CONTINUOUS, backend="rust")
+        py = Encoder(dimension=64, depth=2, seed=0,
+                     features=FEATURES_CONTINUOUS, backend="numpy")
+        assert_backends_agree(good.encode(SWEEP_SMILES), py.encode(SWEEP_SMILES))
+
+    def test_nonfinite_node_hv_rejected_at_the_boundary(self):
+        """The low-level entry point guards itself, not just the Encoder."""
+        from hyper_fingerprints._core import encode_batch_hv_rs
+
+        hv = np.ones((2, 8))
+        edge = np.array([[0, 1], [1, 0]], dtype=np.int64)
+        batch = np.array([0, 0], dtype=np.int64)
+        for bad in (np.inf, -np.inf, np.nan):
+            poisoned = hv.copy()
+            poisoned[0, 0] = bad
+            with pytest.raises(ValueError):
+                encode_batch_hv_rs(poisoned, edge, batch, 1, 1, "none", False)
+
+        # Finite input still works.
+        out, _ = encode_batch_hv_rs(hv, edge, batch, 1, 1, "none", False)
+        assert np.all(np.isfinite(out))
+
+    @pytest.mark.parametrize("depth", [1, 2, 3, 4, 5, 6])
+    def test_depth_up_to_six_is_the_supported_range(self, depth):
+        """Agreement holds to ~1e-12 through depth 6 -- the supported claim.
+
+        Measured on 100 real PubChem molecules across dims 64-512, both
+        feature kinds and both `normalize` settings, the worst deviation
+        through depth 6 is 4.6e-13. Beyond depth 6 conditioning degrades; see
+        `test_deep_message_passing_degrades`.
+        """
+        categorical = {"element": {"kind": "categorical"},
+                       "hydrogens": {"kind": "categorical"},
+                       "aromatic": {"kind": "categorical"}}
+        for features in (FEATURES_CONTINUOUS, categorical):
+            for dim in (64, 256):
+                for normalize in (True, False):
+                    kw = dict(dimension=dim, depth=depth, seed=0,
+                              normalize=normalize, features=features)
+                    py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
+                    rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
+                    assert_backends_agree(rs, py)
+
+    def test_deep_message_passing_degrades(self):
+        """Pins the honest upper limit rather than implying there isn't one.
+
+        Message passing is ill-conditioned at large depth: each layer binds
+        the state with an aggregate of its neighbours, so rounding differences
+        amplify. Past depth ~7 the backends can part company well beyond
+        ROW_TOL -- ~1e-9 at depth 8 for an all-categorical configuration, and
+        arbitrarily far once magnitudes approach the float64 ceiling (~1e186),
+        where the result is meaningless on either backend anyway.
+
+        This is conditioning, not a port defect: perturbing `node_hv` by one
+        ULP moves the NumPy result by a comparable amount. The test asserts
+        the *shape* of the limit -- deep results stay finite or fail cleanly,
+        and shallow results remain tight -- so the documented boundary cannot
+        silently drift.
+        """
+        categorical = {"element": {"kind": "categorical"},
+                       "hydrogens": {"kind": "categorical"},
+                       "aromatic": {"kind": "categorical"}}
+        shallow = deep = None
+        for dim in (256, 512):
+            kw = dict(dimension=dim, seed=42, normalize=True, features=categorical)
+            for depth, slot in ((3, "shallow"), (8, "deep")):
+                py = Encoder(**kw, depth=depth, backend="numpy").encode(SWEEP_SMILES)
+                rs = Encoder(**kw, depth=depth, backend="rust").encode(SWEEP_SMILES)
+                dev = row_scaled_deviation(rs, py)
+                if slot == "shallow":
+                    shallow = max(shallow or 0.0, dev)
+                else:
+                    deep = max(deep or 0.0, dev)
+
+        assert shallow < 1e-12, f"depth 3 should stay tight, got {shallow:.2e}"
+        # Deep is allowed to be loose, but must not be catastrophic in this
+        # normalized configuration -- that would signal a real defect.
+        assert deep < 1e-6, f"depth 8 deviated {deep:.2e}, beyond conditioning"
+        assert deep > shallow, "expected depth to degrade agreement"

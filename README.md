@@ -215,6 +215,41 @@ dominant remaining cost.
 - **Codebook scales with vocabulary** — the codebook has
   `product(feature_bins)` entries (1296 for the default 9 atom types). Large
   custom atom type lists will increase memory usage.
+- **Unnormalized embeddings overflow at large `depth`** — each layer multiplies
+  hypervector magnitudes, so `normalize=False` reaches ~1e7 by depth 3 and
+  overflows `float64` somewhere past depth 10. The NumPy backend returns
+  `inf`/`NaN`; the Rust backend raises `ValueError`. Use `normalize=True` for
+  depth beyond ~4.
+- **Keep `bandwidth` on the order of the feature's value range** — a continuous
+  feature encodes as `spectrum ** (value / bandwidth)`, so a bandwidth far
+  below the values drives the exponent large and the embedding with it (a
+  bandwidth of 0.05 on a feature reaching 3 gives magnitudes of ~1e63, which is
+  numerically meaningless on either backend). Too small a bandwidth raises
+  `ValueError` on the Rust backend and yields `NaN` on NumPy.
+
+### Backend agreement
+
+The Rust and NumPy backends are not bit-identical — they use different FFT
+implementations, and Rust evaluates `z ** e` as `exp(e · ln z)` where NumPy
+switches to repeated multiplication for real integer exponents with `|e| < 100`.
+Measured deviation, scaled by each row's own magnitude, over 100 real PubChem
+molecules across dimensions 64–512, both feature kinds and both `normalize`
+settings:
+
+| regime | agreement |
+|---|---|
+| depth 1–3 | better than 1e-14 |
+| depth 4–6 | better than 5e-13 |
+| depth 7–8 | usually ~1e-13, but excursions to ~1e-9 |
+| magnitudes near the float64 ceiling (~1e186) | arbitrary — meaningless on either backend |
+| bandwidth far below the value range (magnitudes ~1e63) | ~5.6e-7 |
+
+**Depth 6 is the supported range for tight agreement.** Message passing is
+ill-conditioned at greater depth: each layer binds the state with an aggregate
+of its neighbours, so rounding differences amplify — perturbing the input by one
+ULP moves the NumPy result by a comparable amount. This is a property of the
+algorithm, not of the port. All of these boundaries are pinned by tests in
+`tests/test_rust_backend.py` so they cannot drift unnoticed.
 
 ## 📦 Installation
 

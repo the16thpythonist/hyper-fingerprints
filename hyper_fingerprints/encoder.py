@@ -162,7 +162,10 @@ class Encoder:
         Random seed for reproducible codebook generation.
     normalize : bool
         L2-normalize hypervectors after each message-passing layer
-        (default False).
+        (default False). Each layer multiplies magnitudes, so leaving this
+        off reaches ~1e7 by ``depth=3`` and overflows float64 past ``depth``
+        ~10 -- where the NumPy backend returns inf/NaN and the Rust backend
+        raises ``ValueError``. Prefer ``normalize=True`` beyond ``depth=4``.
     codebook : np.ndarray, optional
         Pre-generated codebook array. If provided, ``seed`` is ignored
         for codebook generation.
@@ -175,7 +178,12 @@ class Encoder:
         composite encoder in which every feature has its own codebook and the
         per-feature hypervectors are bound together; ``cfg["kind"]`` is
         ``"categorical"`` or ``"continuous"`` (FHRR fractional power encoding,
-        requires ``cfg["bandwidth"]``). See :mod:`hyper_fingerprints.presets`.
+        requires ``cfg["bandwidth"]``). Keep ``bandwidth`` on the order of the
+        feature's value range: the value is encoded as
+        ``spectrum ** (value / bandwidth)``, so a much smaller bandwidth drives
+        the exponent -- and the embedding magnitude -- to numerically useless
+        sizes (bandwidth 0.05 on a feature reaching 3 gives ~1e63). See
+        :mod:`hyper_fingerprints.presets`.
     graph_features : dict[str, dict], optional
         Graph-level features (``"graph_size"``, ``"graph_diameter"``,
         ``"graph_total_charge"``) with the same config format. Composite
