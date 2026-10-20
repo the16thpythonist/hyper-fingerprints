@@ -678,7 +678,9 @@ class TestCompositeSweep:
         feats = {"element": {"kind": "categorical"},
                  "degree": {"kind": "continuous", "bandwidth": 0.05},
                  "charge": {"kind": "continuous", "bandwidth": 0.05}}
-        kw = dict(dimension=128, depth=2, seed=7, features=feats)
+        # Gaussian spectra only: unit-modulus spectra (the default) keep every
+        # magnitude at one, so no bandwidth drives them to overflow.
+        kw = dict(dimension=128, depth=2, seed=7, features=feats, unit_modulus=False)
         py = Encoder(**kw, backend="numpy").encode(SWEEP_SMILES)
         rs = Encoder(**kw, backend="rust").encode(SWEEP_SMILES)
 
@@ -790,7 +792,8 @@ class TestNumericalLimits:
         """Node encoding: `spectrum ** e` overflows for a huge exponent."""
         feats = {"element": {"kind": "categorical"},
                  "degree": {"kind": "continuous", "bandwidth": 1e-6}}
-        enc = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust")
+        enc = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust",
+                      unit_modulus=False)  # Gaussian spectra; unit modulus cannot overflow
         with pytest.raises(ValueError) as excinfo:
             enc.encode(["CCO"])
         msg = str(excinfo.value)
@@ -813,7 +816,8 @@ class TestNumericalLimits:
         """`except Exception` must catch it, and the encoder must still work."""
         feats = {"element": {"kind": "categorical"},
                  "degree": {"kind": "continuous", "bandwidth": 1e-6}}
-        bad = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust")
+        bad = Encoder(dimension=64, depth=2, seed=0, features=feats, backend="rust",
+                      unit_modulus=False)  # Gaussian spectra; unit modulus cannot overflow
         caught = 0
         for _ in range(3):
             try:

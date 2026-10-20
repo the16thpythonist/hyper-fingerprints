@@ -9,8 +9,55 @@ import numpy as np
 from hyper_fingerprints.utils import TupleIndexer
 
 
+# ───────────────────── Unit-modulus (FHRR) transform ─────────────────────
+
+
+def to_unit_modulus(spectrum: np.ndarray) -> np.ndarray:
+    """Set every complex Fourier coefficient to magnitude one, keeping its phase.
+
+    Coefficients that are exactly zero have no phase and become one. A
+    Hermitian-symmetric spectrum stays Hermitian-symmetric, so the
+    corresponding time-domain vector stays real. Port of
+    ``graph_hdc.utils.to_unit_modulus``.
+    """
+    spectrum = np.asarray(spectrum, dtype=np.complex128)
+    magnitude = np.abs(spectrum)
+    nonzero = magnitude > 0
+    unit = spectrum / np.where(nonzero, magnitude, 1.0)
+    return np.where(nonzero, unit, 1.0 + 0.0j)
+
+
+def unit_modulus_vectors(vectors: np.ndarray) -> np.ndarray:
+    """Real vectors ``[..., D]`` -> same phases, all Fourier magnitudes one.
+
+    The result is a unitary HRR vector (FHRR seen through the FFT): its
+    Euclidean norm is exactly one (Parseval), and binding with it by
+    circular convolution preserves norms instead of concentrating the
+    bound vector on a few Fourier components.
+    """
+    spectrum = np.fft.fft(np.asarray(vectors, dtype=np.float64), axis=-1)
+    return np.fft.ifft(to_unit_modulus(spectrum), axis=-1).real
+
+
+def is_unit_modulus(arr: np.ndarray, *, atol: float = 1e-9) -> bool:
+    """True if every Fourier coefficient of ``arr`` has magnitude one.
+
+    ``arr`` is either real vectors ``[..., D]`` (transformed along the last
+    axis) or a complex spectrum, as stored by the codebooks.
+    """
+    arr = np.asarray(arr)
+    spectrum = arr if np.iscomplexobj(arr) else np.fft.fft(arr, axis=-1)
+    return bool(np.allclose(np.abs(spectrum), 1.0, rtol=0.0, atol=atol))
+
+
 class FeatureEncoder:
-    """Encodes multi-dimensional feature tuples into HRR hypervectors."""
+    """Encodes multi-dimensional feature tuples into HRR hypervectors.
+
+    With ``unit_modulus=True`` (default) every codebook row is the Gaussian
+    draw with its Fourier magnitudes set to one (see
+    :func:`unit_modulus_vectors`); ``False`` keeps the L2-normalized Gaussian
+    rows of versions before 0.5.0. Both use the same random draw.
+    """
 
     def __init__(
         self,
@@ -20,10 +67,12 @@ class FeatureEncoder:
         *,
         seed: int | None = None,
         codebook: np.ndarray | None = None,
+        unit_modulus: bool = True,
     ) -> None:
         self.dim = dim
         self.num_categories = num_categories
         self.indexer = indexer
+        self.unit_modulus = unit_modulus
 
         if codebook is not None:
             self.codebook = codebook
@@ -33,6 +82,8 @@ class FeatureEncoder:
 
     def _generate_codebook(self, rng: np.random.Generator) -> np.ndarray:
         cb = rng.standard_normal((self.num_categories, self.dim))
+        if self.unit_modulus:
+            return unit_modulus_vectors(cb)
         norms = np.linalg.norm(cb, axis=-1, keepdims=True)
         cb = cb / norms
         return cb
@@ -81,7 +132,9 @@ class CategoricalCodebook:
     """One random unit-scale hypervector per category.
 
     Rows are drawn from ``Normal(0, 1/sqrt(dim))`` -- the same distribution
-    graph_hdc uses for its categorical encoders.
+    graph_hdc uses for its categorical encoders. With ``unit_modulus=True``
+    (default, as graph_hdc's ``AtomEncoder``) the Fourier magnitudes of each
+    drawn row are then set to one; ``False`` keeps the Gaussian rows.
     """
 
     kind = "categorical"
@@ -93,9 +146,11 @@ class CategoricalCodebook:
         *,
         seed: int | None = None,
         vectors: np.ndarray | None = None,
+        unit_modulus: bool = True,
     ) -> None:
         self.dim = dim
         self.num_categories = num_categories
+        self.unit_modulus = unit_modulus
         if vectors is not None:
             vectors = np.asarray(vectors, dtype=np.float64)
             if vectors.shape != (num_categories, dim):
@@ -106,6 +161,8 @@ class CategoricalCodebook:
         else:
             rng = np.random.default_rng(seed)
             self.vectors = rng.normal(0.0, 1.0 / np.sqrt(dim), size=(num_categories, dim))
+            if unit_modulus:
+                self.vectors = unit_modulus_vectors(self.vectors)
 
     @property
     def array(self) -> np.ndarray:
@@ -123,6 +180,14 @@ class ContinuousCodebook:
     A value ``v`` is encoded as ``ifft(spectrum ** (v / bandwidth)).real``.
     Nearby values yield similar hypervectors; ``encode(a) (*) encode(b) ==
     encode(a + b)`` under circular convolution.
+
+    With ``unit_modulus=True`` (default, as graph_hdc's ``ContinuousEncoder``)
+    every coefficient of the base spectrum has magnitude one and only its
+    random phase is kept, so a value only rotates the phases: every encoded
+    value has unit norm and the similarity of two values depends only on
+    their difference (a sinc kernel in expectation). ``False`` keeps the
+    complex Gaussian spectrum, whose random magnitudes are raised to the
+    power ``v / bandwidth`` as well. Both use the same random draw.
     """
 
     kind = "continuous"
@@ -134,9 +199,11 @@ class ContinuousCodebook:
         *,
         seed: int | None = None,
         spectrum: np.ndarray | None = None,
+        unit_modulus: bool = True,
     ) -> None:
         self.dim = dim
         self.bandwidth = float(bandwidth)
+        self.unit_modulus = unit_modulus
         if spectrum is not None:
             spectrum = np.asarray(spectrum, dtype=np.complex128)
             if spectrum.shape != (dim,):
@@ -145,6 +212,8 @@ class ContinuousCodebook:
         else:
             rng = np.random.default_rng(seed)
             self.spectrum = generate_hermitian_spectrum(dim, rng)
+            if unit_modulus:
+                self.spectrum = to_unit_modulus(self.spectrum)
 
     @property
     def array(self) -> np.ndarray:
@@ -164,7 +233,8 @@ class CompositeEncoder:
     ``num_categories``, for continuous ``bandwidth``. ``seed_offset`` is
     optional and defaults to ``10 * position``. Continuous codebooks are
     seeded with ``seed + offset + 1`` (mirroring graph_hdc's
-    ``ContinuousEncoder``).
+    ``ContinuousEncoder``). ``unit_modulus`` is passed to every codebook that
+    is sampled here; preset ``codebooks`` are always used as given.
 
     Encoding is a single FFT product over all feature hypervectors followed
     by one inverse FFT, numerically matching
@@ -178,9 +248,11 @@ class CompositeEncoder:
         *,
         seed: int | None = None,
         codebooks: dict[str, np.ndarray] | None = None,
+        unit_modulus: bool = True,
     ) -> None:
         self.dim = dim
         self.feature_cfgs = feature_cfgs
+        self.unit_modulus = unit_modulus
         self.codebooks: dict[str, CategoricalCodebook | ContinuousCodebook] = {}
 
         for position, (name, cfg) in enumerate(feature_cfgs.items()):
@@ -193,6 +265,7 @@ class CompositeEncoder:
                     int(cfg["num_categories"]),
                     seed=None if seed is None else seed + offset,
                     vectors=preset,
+                    unit_modulus=unit_modulus,
                 )
             elif kind == "continuous":
                 self.codebooks[name] = ContinuousCodebook(
@@ -200,6 +273,7 @@ class CompositeEncoder:
                     float(cfg["bandwidth"]),
                     seed=None if seed is None else seed + offset + 1,
                     spectrum=preset,
+                    unit_modulus=unit_modulus,
                 )
             else:
                 raise ValueError(

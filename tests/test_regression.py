@@ -11,7 +11,9 @@ Fixtures are stored as framework-agnostic ``.npz`` files (numpy arrays).
 Note: the recorded codebook is *injected* into the encoder under test, so
 ``regression_data.npz`` protects the message-passing pipeline only. The
 seed -> codebook generation of both encoder modes is protected separately by
-``seed_fixtures.npz`` (see ``TestSeedFixtures``).
+``seed_fixtures_unit.npz`` (unit-modulus default) and ``seed_fixtures.npz``
+(recorded with 0.4.0, reproduced by ``unit_modulus=False``); see
+``TestSeedFixtures``.
 """
 
 import json
@@ -73,24 +75,35 @@ def encoder(fixture_data):
 # ── Seed -> codebook / output stability ────────────────────────────────
 
 
-SEED_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "seed_fixtures.npz"
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
 
-@pytest.fixture(scope="module")
-def seed_fixture():
-    if not SEED_FIXTURE_PATH.exists():
+@pytest.fixture(
+    scope="module",
+    params=[("seed_fixtures_unit.npz", True), ("seed_fixtures.npz", False)],
+    ids=["unit_modulus", "gaussian_0.4.0"],
+)
+def seed_fixture(request):
+    name, unit_modulus = request.param
+    path = FIXTURE_DIR / name
+    if not path.exists():
         pytest.skip("Seed fixtures not found. Run 'python -m tests.generate_fixtures'.")
-    raw = np.load(SEED_FIXTURE_PATH, allow_pickle=False)
-    return raw, json.loads(str(raw["config"]))
+    raw = np.load(path, allow_pickle=False)
+    cfg = json.loads(str(raw["config"]))
+    cfg["unit_modulus"] = unit_modulus
+    return raw, cfg
 
 
 class TestSeedFixtures:
     """Codebooks generated from a seed, and composite-mode outputs, must match
-    the values recorded by ``generate_fixtures.py`` (no codebook injection)."""
+    the values recorded by ``generate_fixtures.py`` (no codebook injection).
+
+    Runs once against the unit-modulus default and once with
+    ``unit_modulus=False`` against the file recorded with 0.4.0."""
 
     def test_legacy_codebook_from_seed(self, seed_fixture):
         raw, cfg = seed_fixture
-        enc = Encoder(dimension=cfg["dimension"], seed=cfg["seed"])
+        enc = Encoder(dimension=cfg["dimension"], seed=cfg["seed"], unit_modulus=cfg["unit_modulus"])
         np.testing.assert_allclose(enc._codebook, raw["legacy_codebook"], atol=ATOL, rtol=0)
 
     def test_composite_codebooks_from_seed(self, seed_fixture):
@@ -98,6 +111,7 @@ class TestSeedFixtures:
         enc = Encoder(
             dimension=cfg["dimension"], depth=cfg["depth"], seed=cfg["seed"], normalize=True,
             features=cfg["features"], graph_features=cfg["graph_features"],
+            unit_modulus=cfg["unit_modulus"],
         )
         for name, arr in enc._node_encoder.arrays().items():
             np.testing.assert_allclose(arr, raw[f"node/{name}"], atol=ATOL, rtol=0, err_msg=name)
@@ -109,6 +123,7 @@ class TestSeedFixtures:
         enc = Encoder(
             dimension=cfg["dimension"], depth=cfg["depth"], seed=cfg["seed"], normalize=True,
             features=cfg["features"], graph_features=cfg["graph_features"],
+            unit_modulus=cfg["unit_modulus"],
         )
         smiles = json.loads(str(raw["composite_smiles"]))
         np.testing.assert_allclose(enc.encode(smiles), raw["composite_encode"], atol=ATOL, rtol=0)

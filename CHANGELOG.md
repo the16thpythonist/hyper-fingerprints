@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-10-20
+
+### Changed
+
+- **Unit-modulus (FHRR) codebooks are the default** in both encoder modes
+  (`unit_modulus=True`, new `Encoder` parameter). Every sampled base vector
+  keeps the phases of its random draw but gets Fourier magnitudes of one:
+  the legacy product-codebook rows, the composite categorical vectors and
+  the base spectra of continuous (fractional power) features. Binding
+  multiplies spectra, so with Gaussian vectors the random magnitudes
+  compounded across message-passing layers and a fingerprint used only a
+  few dozen effective Fourier components at any dimension (D=2048, depth 2:
+  ~8-75; now ~390-480). This follows graph_hdc, where the same change
+  (ablation ex_22) reduced the seed dependence and improved property
+  prediction on 4 of 5 datasets.
+- **Breaking for seeded output:** the same `seed` now gives different
+  fingerprints. `unit_modulus=False` reproduces 0.4.0 bit for bit (same
+  draw; pinned against `seed_fixtures.npz`, recorded with 0.4.0).
+  Codebooks that are passed in (`codebook`, `node_codebooks`,
+  `graph_codebooks`, `Encoder.load`, `Encoder.from_legacy_codebook`) are
+  used as given, never transformed.
+- `save` stores `unit_modulus`. When every codebook is passed in (including
+  `Encoder.load` and `Encoder.from_legacy_codebook`), the attribute is set
+  from the arrays themselves, so it always describes the vectors in use;
+  files written before 0.5.0 load with `unit_modulus=False`.
+- Continuous features can no longer overflow in the node encoding: a unit
+  spectrum raised to any power keeps magnitude one. The overflow tests now
+  pin `unit_modulus=False`. Unnormalized message passing still grows (~1e2 at
+  depth 3, overflow at depth ~10; Gaussian: ~1e4-1e7 and ~9).
+
+### Added
+
+- `codebook.to_unit_modulus` and `codebook.unit_modulus_vectors` (ports of
+  `graph_hdc.utils.to_unit_modulus` and the `AtomEncoder` transform) and
+  `codebook.is_unit_modulus`.
+- `tests/fixtures/graph_hdc_unit_codebook.npz` and its generator
+  `tests/generate_graph_hdc_unit_fixture.py`, recorded with graph_hdc's
+  unit-modulus encoder (commit stored in the fixture), and
+  `tests/test_graph_hdc_unit_parity.py`: seeded FPE spectra equal
+  graph_hdc's (<= 1e-14), the categorical transform equals graph_hdc's, and
+  the imported codebook reproduces graph_hdc's embeddings on both backends.
+- `tests/test_unit_modulus.py`: unit magnitudes for every mode, dimensions
+  1-256 and seeds 0, 1, 42; same draw and phases as `unit_modulus=False`;
+  binding keeps unit modulus; FPE norms and difference-only similarity;
+  effective Fourier components (>= 3x the Gaussian codebooks, measured 5x to
+  50x); NumPy == Rust for both settings across dimensions, depths, graph
+  modes and edge directions; save/load including 0.4.0-era files.
+- `tests/fixtures/seed_fixtures_unit.npz`: seeded codebooks and outputs of
+  the new default; `TestSeedFixtures` runs against both seed fixtures.
+  `generate_fixtures.py` never regenerates `seed_fixtures.npz`.
+
 ## [0.4.0] - 2026-09-15
 
 ### Added

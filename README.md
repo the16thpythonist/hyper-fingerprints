@@ -78,6 +78,7 @@ Encoder(
     seed=None,          # random seed for reproducible codebook generation
     normalize=False,    # L2-normalize after each message-passing layer
     backend="auto",     # "auto" | "rust" | "numpy"
+    unit_modulus=True,  # unit-magnitude (FHRR) codebooks; False = Gaussian codebooks of < 0.5.0
 )
 ```
 
@@ -104,6 +105,27 @@ fingerprint scheme or deploying without needing to track the seed.
 enc.save("encoder.npz")
 loaded = Encoder.load("encoder.npz")
 ```
+
+### Codebooks
+
+Every random base vector (the product-codebook rows, the categorical feature
+vectors and the base spectra of continuous features) is sampled with Fourier
+coefficients of magnitude one: a Gaussian draw keeps only its random phases,
+as in Fourier holographic reduced representations (FHRR). Binding by circular
+convolution multiplies spectra, and message passing binds at every layer, so
+the random magnitudes of Gaussian vectors compound until a few Fourier
+components carry most of a fingerprint. With unit-magnitude vectors binding
+preserves norms and the fingerprint keeps using all components (at
+`dimension=2048`, `depth=2`: ~390-480 effective components instead of
+~8-75), which also makes results far less dependent on the seed. This
+matches the encoder of the HDF paper and graph_hdc's continuous-mode
+encoders (the legacy product codebook has no graph_hdc counterpart and is
+switched as well).
+
+Unit-magnitude codebooks are the default since 0.5.0, so the same `seed`
+gives different fingerprints than in 0.4.x. `unit_modulus=False` reproduces
+the Gaussian codebooks of earlier versions bit for bit. Saved encoders keep
+the vectors they were saved with.
 
 ### Parameter guidance
 
@@ -176,7 +198,7 @@ Further options: `bidirectional=False` uses a single directed edge per bond
 to a shared extra codebook row instead of raising.
 
 Recommendation: use `normalize=True` with continuous features; without
-per-layer normalization the FHRR magnitudes compound across message-passing
+per-layer normalization the magnitudes compound across message-passing
 layers.
 
 ### Importing a graph_hdc codebook
@@ -216,16 +238,18 @@ dominant remaining cost.
   `product(feature_bins)` entries (1296 for the default 9 atom types). Large
   custom atom type lists will increase memory usage.
 - **Unnormalized embeddings overflow at large `depth`** — each layer multiplies
-  hypervector magnitudes, so `normalize=False` reaches ~1e7 by depth 3 and
-  overflows `float64` somewhere past depth 10. The NumPy backend returns
-  `inf`/`NaN`; the Rust backend raises `ValueError`. Use `normalize=True` for
-  depth beyond ~4.
+  hypervector magnitudes, so `normalize=False` reaches ~1e2 by depth 3 and
+  overflows `float64` at depth ~10 (with `unit_modulus=False`: ~1e4 to 1e7 by
+  depth 3, overflow at ~9). The NumPy backend returns `inf`/`NaN`; the Rust
+  backend raises `ValueError`. Use `normalize=True` for depth beyond ~4.
 - **Keep `bandwidth` on the order of the feature's value range** — a continuous
   feature encodes as `spectrum ** (value / bandwidth)`, so a bandwidth far
-  below the values drives the exponent large and the embedding with it (a
-  bandwidth of 0.05 on a feature reaching 3 gives magnitudes of ~1e63, which is
-  numerically meaningless on either backend). Too small a bandwidth raises
-  `ValueError` on the Rust backend and yields `NaN` on NumPy.
+  below the values makes neighbouring values nearly orthogonal. With
+  `unit_modulus=False` the random spectral magnitudes are raised to that power
+  too, which drives the embedding magnitude up (a bandwidth of 0.05 on a
+  feature reaching 3 gives ~1e63, numerically meaningless on either backend;
+  far smaller bandwidths raise `ValueError` on the Rust backend and yield `NaN`
+  on NumPy). Unit-magnitude spectra keep magnitude one at any bandwidth.
 
 ### Backend agreement
 
@@ -242,7 +266,7 @@ settings:
 | depth 4–6 | better than 5e-13 |
 | depth 7–8 | usually ~1e-13, but excursions to ~1e-9 |
 | magnitudes near the float64 ceiling (~1e186) | arbitrary — meaningless on either backend |
-| bandwidth far below the value range (magnitudes ~1e63) | ~5.6e-7 |
+| bandwidth far below the value range, `unit_modulus=False` (magnitudes ~1e63) | ~5.6e-7 |
 
 **Depth 6 is the supported range for tight agreement.** Message passing is
 ill-conditioned at greater depth: each layer binds the state with an aggregate

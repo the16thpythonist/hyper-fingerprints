@@ -71,6 +71,8 @@ preparation is now the largest single item on the Rust backend.
 Composite parity is asserted with `atol=1e-10, rtol=1e-11` rather than the legacy
 `rtol=0`: unnormalized composite embeddings reach magnitudes of ~1e6 at depth 3, where an
 absolute-only tolerance is meaningless. Observed worst-case relative deviation is ~6e-12.
+(Measured with the Gaussian codebooks of 0.4.0; the unit-modulus default of 0.5.0 keeps
+magnitudes far smaller, ~1e2 at depth 3, and `tests/test_unit_modulus.py` checks both.)
 
 Node hypervectors are additionally compared **directly**, before message passing can smear a
 discrepancy (`TestCompositeNodeEncoding`): both presets x `dim` in {64, 127, 128, 255, 256, 257,

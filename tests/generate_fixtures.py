@@ -10,13 +10,19 @@ Two fixture files are written (paths relative to the repository root):
 - ``tests/fixtures/regression_data.npz`` -- legacy encoder outputs with the
   codebook stored alongside and re-injected by the tests (protects the
   message-passing pipeline). Regenerating this changes the codebook.
-- ``tests/fixtures/seed_fixtures.npz`` -- codebooks generated from a seed for
-  both encoder modes plus composite-mode outputs (protects seed -> codebook
-  RNG paths and composite-mode stability).
+- ``tests/fixtures/seed_fixtures_unit.npz`` -- codebooks generated from a
+  seed for both encoder modes plus composite-mode outputs (protects seed ->
+  codebook RNG paths and composite-mode stability), with the unit-modulus
+  codebooks that are the default since 0.5.0.
+- ``tests/fixtures/seed_fixtures.npz`` -- the same with ``unit_modulus=False``.
+  This file was recorded with 0.4.0 (Gaussian codebooks) and pins that
+  ``unit_modulus=False`` reproduces it bit for bit, so it is never
+  regenerated: ``generate_seed_fixtures(unit_modulus=False)`` refuses to
+  overwrite it.
 
 Usage:
-    python -m tests.generate_fixtures            # both files
-    python -m tests.generate_fixtures seed       # seed_fixtures.npz only
+    python -m tests.generate_fixtures            # regression_data.npz + seed_fixtures_unit.npz
+    python -m tests.generate_fixtures seed       # seed_fixtures_unit.npz only
 """
 
 import json
@@ -129,20 +135,23 @@ def main() -> None:
     print(f"  encode_joint shape: {batch_encode_joint.shape}")
 
 
-def generate_seed_fixtures() -> None:
+def generate_seed_fixtures(unit_modulus: bool = True) -> None:
     """Record seed-generated codebooks and composite-mode outputs."""
     seed, dimension, depth = 7, 64, 2
     composite_smiles = ["CCO", "c1ccccc1", "CC(=O)Nc1ccc(O)cc1", "C", "CC.O"]
 
-    legacy = Encoder(dimension=dimension, seed=seed)
+    legacy = Encoder(dimension=dimension, seed=seed, unit_modulus=unit_modulus)
     composite = Encoder(
         dimension=dimension, depth=depth, seed=seed, normalize=True,
         features=FEATURES_GRAPH_HDC, graph_features=GRAPH_FEATURES_GRAPH_HDC,
+        unit_modulus=unit_modulus,
     )
     config = {
         "seed": seed, "dimension": dimension, "depth": depth,
         "features": FEATURES_GRAPH_HDC, "graph_features": GRAPH_FEATURES_GRAPH_HDC,
     }
+    if unit_modulus:
+        config["unit_modulus"] = True
     save_dict = {
         "config": np.array(json.dumps(config)),
         "legacy_codebook": legacy._codebook,
@@ -153,14 +162,19 @@ def generate_seed_fixtures() -> None:
     save_dict.update({f"node/{k}": v for k, v in composite._node_encoder.arrays().items()})
     save_dict.update({f"graph/{k}": v for k, v in composite._graph_encoder.arrays().items()})
 
-    out_path = FIXTURE_DIR / "seed_fixtures.npz"
+    out_path = FIXTURE_DIR / ("seed_fixtures_unit.npz" if unit_modulus else "seed_fixtures.npz")
+    if not unit_modulus and out_path.exists():
+        raise SystemExit(
+            f"{out_path} is the 0.4.0 record that unit_modulus=False must reproduce; "
+            "refusing to overwrite it"
+        )
     np.savez(out_path, **save_dict)
     print(f"Saved seed fixtures to {out_path}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "seed":
-        generate_seed_fixtures()
+        generate_seed_fixtures(unit_modulus=True)
     else:
         main()
-        generate_seed_fixtures()
+        generate_seed_fixtures(unit_modulus=True)

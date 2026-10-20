@@ -12,7 +12,7 @@ from typing import Union
 import numpy as np
 from rdkit import Chem
 
-from hyper_fingerprints.codebook import CompositeEncoder, FeatureEncoder
+from hyper_fingerprints.codebook import CompositeEncoder, FeatureEncoder, is_unit_modulus
 from hyper_fingerprints.features import (
     DEFAULT_ATOM_TYPES,
     DEFAULT_FEATURES,
@@ -163,8 +163,9 @@ class Encoder:
     normalize : bool
         L2-normalize hypervectors after each message-passing layer
         (default False). Each layer multiplies magnitudes, so leaving this
-        off reaches ~1e7 by ``depth=3`` and overflows float64 past ``depth``
-        ~10 -- where the NumPy backend returns inf/NaN and the Rust backend
+        off reaches ~1e2 by ``depth=3`` (~1e4 to 1e7 with
+        ``unit_modulus=False``) and overflows float64 at ``depth`` ~10 (~9)
+        -- where the NumPy backend returns inf/NaN and the Rust backend
         raises ``ValueError``. Prefer ``normalize=True`` beyond ``depth=4``.
     codebook : np.ndarray, optional
         Pre-generated codebook array. If provided, ``seed`` is ignored
@@ -180,9 +181,11 @@ class Encoder:
         ``"categorical"`` or ``"continuous"`` (FHRR fractional power encoding,
         requires ``cfg["bandwidth"]``). Keep ``bandwidth`` on the order of the
         feature's value range: the value is encoded as
-        ``spectrum ** (value / bandwidth)``, so a much smaller bandwidth drives
-        the exponent -- and the embedding magnitude -- to numerically useless
-        sizes (bandwidth 0.05 on a feature reaching 3 gives ~1e63). See
+        ``spectrum ** (value / bandwidth)``, so a much smaller bandwidth makes
+        neighbouring values nearly orthogonal. With ``unit_modulus=False`` the
+        random spectral magnitudes are raised to that power as well, which
+        drives the embedding magnitude to numerically useless sizes
+        (bandwidth 0.05 on a feature reaching 3 gives ~1e63). See
         :mod:`hyper_fingerprints.presets`.
     graph_features : dict[str, dict], optional
         Graph-level features (``"graph_size"``, ``"graph_diameter"``,
@@ -203,6 +206,19 @@ class Encoder:
     node_codebooks, graph_codebooks : dict[str, np.ndarray], optional
         Pre-generated per-feature base arrays for composite mode (used by
         :meth:`load` and :meth:`from_legacy_codebook`).
+    unit_modulus : bool
+        If True (default) every sampled codebook vector -- legacy product
+        codebook rows, categorical feature vectors and the base spectra of
+        continuous features -- has Fourier coefficients of magnitude one
+        (FHRR): the random draw keeps only its phases. Binding then preserves
+        norms and repeated binding during message passing does not
+        concentrate the fingerprint on a few Fourier components. False
+        reproduces the Gaussian codebooks of versions before 0.5.0 bit for
+        bit (same seed, same draw). Codebooks that are passed in
+        (``codebook``, ``node_codebooks``, ``graph_codebooks``, :meth:`load`)
+        are used as given; when every codebook is passed in, the attribute
+        ``unit_modulus`` is set from the arrays themselves, so it always
+        describes the vectors in use.
     backend : str
         Encoding backend: ``"auto"`` (use Rust if available, else NumPy),
         ``"rust"`` (require Rust extension), or ``"numpy"`` (force pure
@@ -238,6 +254,7 @@ class Encoder:
         unknown_atoms: str = "error",
         node_codebooks: dict[str, np.ndarray] | None = None,
         graph_codebooks: dict[str, np.ndarray] | None = None,
+        unit_modulus: bool = True,
     ) -> None:
         self.dimension = dimension
         self.depth = depth
@@ -250,6 +267,7 @@ class Encoder:
         self.graph_mode = graph_mode
         self.bidirectional = bidirectional
         self.unknown_atoms = unknown_atoms
+        self.unit_modulus = unit_modulus
 
         if isinstance(self.features, dict):
             self.mode = "composite"
@@ -281,6 +299,7 @@ class Encoder:
                 indexer=self._indexer,
                 seed=seed,
                 codebook=codebook,
+                unit_modulus=unit_modulus,
             )
             self._codebook = self._encoder.codebook
             self._node_encoder = None
@@ -297,13 +316,35 @@ class Encoder:
                     )
                 node_cfgs[name] = cfg
             self._node_encoder = CompositeEncoder(
-                dimension, node_cfgs, seed=seed, codebooks=node_codebooks
+                dimension, node_cfgs, seed=seed, codebooks=node_codebooks,
+                unit_modulus=unit_modulus,
             )
             self._graph_encoder = None
             if self._graph_feature_defs:
                 self._graph_encoder = CompositeEncoder(
-                    dimension, dict(self.graph_features), seed=seed, codebooks=graph_codebooks
+                    dimension, dict(self.graph_features), seed=seed, codebooks=graph_codebooks,
+                    unit_modulus=unit_modulus,
                 )
+
+        # When nothing was sampled, the flag describes the passed-in arrays.
+        given = self._given_codebook_arrays(codebook, node_codebooks, graph_codebooks)
+        if given is not None:
+            self.unit_modulus = all(is_unit_modulus(arr) for arr in given)
+
+    def _given_codebook_arrays(self, codebook, node_codebooks, graph_codebooks):
+        """All codebook arrays if every one of them was passed in, else None."""
+        if self.mode == "legacy":
+            return None if codebook is None else [self._codebook]
+        node_cbs = node_codebooks or {}
+        graph_cbs = graph_codebooks or {}
+        if any(name not in node_cbs for name in self.features):
+            return None
+        if any(name not in graph_cbs for name in (self.graph_features or {})):
+            return None
+        arrays = list(self._node_encoder.arrays().values())
+        if self._graph_encoder is not None:
+            arrays += list(self._graph_encoder.arrays().values())
+        return arrays
 
     # ───────────────────── Validation ─────────────────────
 
@@ -321,7 +362,7 @@ class Encoder:
             raise ValueError(f"depth must be a non-negative integer, got {self.depth!r}")
         if self.seed is not None and (not _is_int(self.seed) or self.seed < 0):
             raise ValueError(f"seed must be None or a non-negative integer, got {self.seed!r}")
-        for name in ("normalize", "bidirectional"):
+        for name in ("normalize", "bidirectional", "unit_modulus"):
             if not _is_bool(getattr(self, name)):
                 raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
         if self.backend not in ("auto", "rust", "numpy"):
@@ -411,6 +452,7 @@ class Encoder:
             "normalize": self.normalize,
             "seed": self.seed,
             "features": self.features,
+            "unit_modulus": self.unit_modulus,
         }
         if self.mode == "legacy":
             np.savez(path, config=np.array(json.dumps(config)), codebook=self._codebook)
@@ -459,6 +501,9 @@ class Encoder:
                 codebook=data["codebook"],
                 features=config.get("features"),
                 backend=backend,
+                # files written before 0.5.0 carry Gaussian codebooks (the
+                # flag is re-derived from the stored arrays anyway)
+                unit_modulus=config.get("unit_modulus", False),
             )
         return cls._from_composite_npz(data, config, backend=backend)
 
@@ -487,6 +532,9 @@ class Encoder:
             unknown_atoms=config.get("unknown_atoms", "error"),
             node_codebooks=node_cbs,
             graph_codebooks=graph_cbs or None,
+            # files written before 0.5.0 carry Gaussian codebooks (re-derived
+            # from the stored arrays when all of them are present)
+            unit_modulus=config.get("unit_modulus", False),
         )
         kwargs.update(overrides)
         return cls(**kwargs)

@@ -8,6 +8,7 @@ from hyper_fingerprints.codebook import (
     CompositeEncoder,
     ContinuousCodebook,
     generate_hermitian_spectrum,
+    to_unit_modulus,
 )
 from hyper_fingerprints.utils import hrr_bind
 
@@ -54,9 +55,24 @@ class TestContinuousCodebook:
         # Only approximately additive: the (real, possibly negative) DC and
         # Nyquist spectral components turn complex under fractional powers
         # and their imaginary parts are discarded -- inherited from graph_hdc.
-        cb = ContinuousCodebook(DIM, bandwidth=1.0, seed=1)
+        # The Gaussian spectrum damps that error by |r| ** (v / bandwidth) of
+        # those two coefficients, which happens to be small for this seed.
+        cb = ContinuousCodebook(DIM, bandwidth=1.0, seed=1, unit_modulus=False)
         a, b, ab = cb.encode(np.array([1.5, 2.25, 3.75]))
         assert np.allclose(hrr_bind(a[None], b[None])[0], ab, atol=1e-4)
+
+    def test_binding_adds_values_unit_modulus(self):
+        # Unit modulus: exactly additive on every frequency except DC and
+        # Nyquist, whose discarded imaginary parts now have magnitude <= 1,
+        # i.e. at most 1/DIM per entry each.
+        cb = ContinuousCodebook(DIM, bandwidth=1.0, seed=1)
+        a, b, ab = cb.encode(np.array([1.5, 2.25, 3.75]))
+        bound = hrr_bind(a[None], b[None])[0]
+        spec_bound, spec_ab = np.fft.fft(bound), np.fft.fft(ab)
+        inner = np.ones(DIM, dtype=bool)
+        inner[[0, DIM // 2]] = False
+        assert np.allclose(spec_bound[inner], spec_ab[inner], atol=1e-10)
+        assert np.max(np.abs(bound - ab)) <= 4.0 / DIM
 
     def test_preset_spectrum_roundtrip(self):
         cb = ContinuousCodebook(DIM, bandwidth=1.0, seed=1)
@@ -111,7 +127,9 @@ class TestCompositeEncoder:
         cfgs = {"degree": {"kind": "continuous", "bandwidth": 2.0, "seed_offset": 20}}
         c = CompositeEncoder(DIM, cfgs, seed=5)
         ref = generate_hermitian_spectrum(DIM, np.random.default_rng(5 + 20 + 1))
-        assert np.array_equal(c.codebooks["degree"].spectrum, ref)
+        assert np.array_equal(c.codebooks["degree"].spectrum, to_unit_modulus(ref))
+        d = CompositeEncoder(DIM, cfgs, seed=5, unit_modulus=False)
+        assert np.array_equal(d.codebooks["degree"].spectrum, ref)
 
     def test_arrays_roundtrip(self):
         a = CompositeEncoder(DIM, self.CFGS, seed=0)
