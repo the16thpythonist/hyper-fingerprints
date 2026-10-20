@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.1] - 2026-10-20
+
+### Fixed
+
+- Release packaging: the v0.5.0 tag built wheels named 0.4.0, because the
+  bump configuration updated `hyper_fingerprints/VERSION` but not
+  `[project] version` in `pyproject.toml`, from which maturin takes the wheel
+  version. PyPI rejected them, so **0.5.0 was never published on PyPI**;
+  0.5.1 is the first PyPI release with the 0.5.0 changes below. The bump
+  configuration now updates both, and `release.sh` stops before committing
+  if the two disagree.
+
 ## [0.5.0] - 2026-10-20
 
 ### Changed

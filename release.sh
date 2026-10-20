@@ -69,6 +69,12 @@ echo "[3/7] Bumping version ($PART)..."
 echo "  Current version: $(cat hyper_fingerprints/VERSION)"
 bump-my-version bump "$PART"
 NEW_VERSION="$(cat hyper_fingerprints/VERSION)"
+PROJECT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
+if [[ "$PROJECT_VERSION" != "$NEW_VERSION" ]]; then
+    echo "ERROR: pyproject.toml [project] version ($PROJECT_VERSION) != VERSION ($NEW_VERSION);"
+    echo "       the wheels would carry the wrong version. Nothing was committed or pushed."
+    exit 1
+fi
 TAG="v$NEW_VERSION"
 echo "  New version:     $NEW_VERSION"
 echo ""

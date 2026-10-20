@@ -1,6 +1,6 @@
 [project]
 name = "hyper_fingerprints"
-version = "0.4.0"
+version = "0.5.0"
 description = "Hyperdimensional molecular fingerprints using Vector Symbolic Architectures"
 requires-python = ">=3.9"
 license = "MIT"
@@ -31,6 +31,14 @@ tag = false
 
 [[tool.bumpversion.files]]
 filename = "hyper_fingerprints/VERSION"
+
+# The wheel version comes from [project] version (maturin); anchored so the
+# current_version line above is not matched as well.
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+regex = true
+search = '^version = "{current_version}"'
+replace = 'version = "{new_version}"'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
